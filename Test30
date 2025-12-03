@@ -1,0 +1,60 @@
+def train_lgbm_with_shap(X, y):
+    """
+    - GridSearch LGBM (RMSE)
+    - SHAP importance
+    - Sélection de features (95% masse) + on force certaines features clés
+    - Retrain final model sur features sélectionnées
+    """
+
+    best_params, cv_table = run_gridsearch(X, y)
+
+    # Modèle "full" pour SHAP, avec un peu de régularisation
+    model_full = LGBMRegressor(
+        **best_params,
+        random_state=42,
+        n_jobs=-1,
+        subsample=0.8,          # anti-overfit
+        colsample_bytree=0.8,   # anti-overfit
+        reg_lambda=5.0,         # L2
+        reg_alpha=1.0,          # L1
+    )
+    model_full.fit(X, y)
+
+    # SHAP sur un sous-échantillon
+    explainer = shap.TreeExplainer(model_full)
+    X_shap = X.sample(min(800, len(X)), random_state=42)
+    shap_vals = explainer.shap_values(X_shap)
+
+    shap_abs = np.abs(shap_vals).mean(axis=0)
+    shap_importances = pd.Series(shap_abs, index=X.columns).sort_values(ascending=False)
+
+    # --- sélection 95% de masse SHAP ---
+    total = shap_importances.sum()
+    cum = 0.0
+    keep_cols = []
+
+    for col, val in shap_importances.items():
+        keep_cols.append(col)
+        cum += val
+        if cum / total >= 0.95:
+            break
+
+    # --- on FORCE certaines features structurantes ---
+    mandatory = ["PC1_basis", "PC2_basis", "d_basis_1d", "spread_T", "slope_usd", "slope_eur"]
+    for m in mandatory:
+        if m in X.columns and m not in keep_cols:
+            keep_cols.append(m)
+
+    # Modèle final plus régularisé
+    model_final = LGBMRegressor(
+        **best_params,
+        random_state=42,
+        n_jobs=-1,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        reg_lambda=5.0,
+        reg_alpha=1.0,
+    )
+    model_final.fit(X[keep_cols], y)
+
+    return model_final, keep_cols, shap_importances, best_params, cv_table
