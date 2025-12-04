@@ -1,0 +1,819 @@
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from lightgbm import LGBMRegressor
+import shap
+import matplotlib.pyplot as plt
+
+import json
+import os
+from typing import Dict, Optional
+
+from hmmlearn import hmm  # pip install hmmlearn
+
+
+HYPERPARAMS_FILE = "lgbm_best_params_per_tenor.json"
+
+
+# ============================================================
+# 0) Load des hyperparamètres sauvegardés
+# ============================================================
+
+def load_saved_hyperparams() -> Dict[str, dict]:
+    if os.path.exists(HYPERPARAMS_FILE):
+        with open(HYPERPARAMS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def make_base_params(saved_params: Optional[dict] = None) -> dict:
+    base = dict(
+        learning_rate=0.03,
+        num_leaves=31,
+        max_depth=4,
+        n_estimators=300,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_samples=20,
+    )
+    if saved_params is not None:
+        base.update(saved_params)
+    base.update(
+        reg_lambda=5.0,
+        reg_alpha=1.0,
+        random_state=42,
+        n_jobs=-1,
+    )
+    return base
+
+
+# ============================================================
+# 1) LGBM + SHAP + sélection de features + refit
+# ============================================================
+
+def train_lgbm_shap_select(X: pd.DataFrame, y: pd.Series, base_params: dict):
+    """
+    1) Entraîne un LGBM sur tous les features
+    2) Calcule les SHAP values
+    3) Garde les features expliquant 95% de la masse SHAP (+ features obligatoires)
+    4) Refit un LGBM final sur ce sous-ensemble.
+    """
+    model_full = LGBMRegressor(**base_params)
+    model_full.fit(X, y)
+
+    explainer = shap.TreeExplainer(model_full)
+    Xs = X.sample(min(800, len(X)), random_state=42)
+    shap_vals = explainer.shap_values(Xs)
+
+    shap_abs = np.abs(shap_vals).mean(axis=0)
+    shap_importances = pd.Series(shap_abs, index=X.columns).sort_values(ascending=False)
+
+    total = shap_importances.sum()
+    cum = 0.0
+    keep_cols = []
+    for col, val in shap_importances.items():
+        keep_cols.append(col)
+        cum += val
+        if cum / total >= 0.95:
+            break
+
+    # Features obligatoires
+    mandatory = ["PC1_basis", "PC2_basis"]
+    for m in mandatory:
+        if m in X.columns and m not in keep_cols:
+            keep_cols.append(m)
+
+    model_final = LGBMRegressor(**base_params)
+    model_final.fit(X[keep_cols], y)
+
+    return model_final, keep_cols, shap_importances
+
+
+# ============================================================
+# 2) STREAMLIT APP (features déjà dans le CSV)
+# ============================================================
+
+def main():
+    st.title("📈 EURUSD Basis Fair Value – HMM + SHAP + Multi-tenors")
+
+    uploaded = st.file_uploader("📄 Upload multi_asset_full_with_macro_features.csv", type=["csv"])
+    if uploaded is None:
+        st.stop()
+
+    df = pd.read_csv(uploaded)
+    if "date" not in df.columns:
+        st.error("Colonne 'date' manquante.")
+        st.stop()
+
+    # Dates au format dd/mm/yyyy
+    df["date"] = pd.to_datetime(df["date"], format="%d/%m/%Y", errors="coerce")
+    df = df.set_index("date").sort_index()
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    # Hyperparams
+    saved_hparams = load_saved_hyperparams()
+    use_saved = st.checkbox(
+        "Utiliser les hyperparamètres sauvegardés du backtest/calib s'ils existent",
+        value=True
+    )
+
+    # Fenêtre de dates
+    min_date = df.index.min().date()
+    max_date = df.index.max().date()
+    st.info(f"Plage disponible : {min_date} → {max_date}")
+
+    col1, col2 = st.columns(2)
+    with col1:
+        start_date = st.date_input(
+            "Start date",
+            value=min_date,
+            min_value=min_date,
+            max_value=max_date,
+        )
+    with col2:
+        end_date = st.date_input(
+            "End date",
+            value=max_date,
+            min_value=min_date,
+            max_value=max_date,
+        )
+
+    if start_date > end_date:
+        st.error("Start date > End date.")
+        st.stop()
+
+    df_win = df.loc[str(start_date):str(end_date)]
+    if df_win.empty:
+        st.error("Fenêtre de dates vide après filtrage.")
+        st.stop()
+
+    st.success(
+        f"Fenêtre utilisée : {df_win.index[0].date()} → {df_win.index[-1].date()} "
+        f"({len[df_win]} points)"
+    )
+
+    # Colonnes basis / tenors
+    basis_cols = [c for c in df_win.columns if c.startswith("EUBASIS_")]
+    if not basis_cols:
+        st.error("Aucune colonne EUBASIS_ trouvée.")
+        st.stop()
+
+    tenors = sorted([c.replace("EUBASIS_", "") for c in basis_cols])
+
+    use_macro = st.checkbox("Inclure les features macro light", value=True)
+
+    sel_tenors = st.multiselect(
+        "Tenors à modéliser",
+        tenors,
+        default=["1Y", "2Y", "5Y", "10Y"] if set(["1Y", "2Y", "5Y", "10Y"]).issubset(tenors) else tenors,
+    )
+    if not sel_tenors:
+        st.stop()
+
+    if st.button("🚀 Run modèle sur la fenêtre"):
+        st.session_state["run_shap"] = True
+    if "run_shap" not in st.session_state or not st.session_state["run_shap"]:
+        st.stop()
+
+    results = {}          # tenor -> DataFrame basis/fair/zscore
+    features_all = {}     # tenor -> liste de features retenues
+    shap_all = {}         # tenor -> SHAP importances globales (Series)
+    models = {}           # tenor -> modèle LGBM final
+    X_used_all = {}       # tenor -> DataFrame des features utilisées
+
+    macro_candidate = [
+        "US_2s10s",
+        "DE_2s10s",
+        "POLICY_DIFF",
+        "CREDIT_US",
+        "CREDIT_EUR_US",
+        "ESTR_FED",
+        "USGG10YR_ret_1d",
+        "GDBR10_ret_1d",
+    ]
+
+    # =================== Boucle par tenor ===================
+    for tenor in sel_tenors:
+        st.subheader(f"Tenor {tenor}")
+
+        target_col = f"TARGET_RV_{tenor}"
+        basis_col = f"EUBASIS_{tenor}"
+        usd_col = f"USDSWAP_{tenor}"
+        eur_col = f"EURSWAP_{tenor}"
+
+        spread_col = f"SPREAD_{tenor}"
+        d1_col = f"D_BASIS_1D_{tenor}"
+        d5_col = f"D_BASIS_5D_{tenor}"
+        vol_col = f"VOL20_{tenor}"
+        mom_col = f"MOM_5_20_{tenor}"
+        ma60_col = f"BASIS_MA60_{tenor}"
+
+        required_cols = [
+            target_col, basis_col, usd_col, eur_col,
+            spread_col, d1_col, d5_col, vol_col, mom_col, ma60_col,
+            "PC1_basis", "PC2_basis", "EURUSD", "D_EURUSD_1D", "VIX", "MOVE",
+        ]
+        missing = [c for c in required_cols if c not in df_win.columns]
+        if missing:
+            st.warning(f"{tenor} ignoré : colonnes manquantes {missing}")
+            continue
+
+        data = df_win[required_cols + macro_candidate].copy()
+
+        if not use_macro:
+            features_cols = [
+                usd_col, eur_col, spread_col,
+                d1_col, d5_col, vol_col, mom_col,
+                "PC1_basis", "PC2_basis",
+                "EURUSD", "D_EURUSD_1D", "VIX", "MOVE",
+            ]
+        else:
+            macro_available = [c for c in macro_candidate if c in data.columns]
+            features_cols = [
+                usd_col, eur_col, spread_col,
+                d1_col, d5_col, vol_col, mom_col,
+                "PC1_basis", "PC2_basis",
+                "EURUSD", "D_EURUSD_1D", "VIX", "MOVE",
+            ] + macro_available
+
+        data = data.dropna(subset=[target_col, ma60_col] + features_cols)
+
+        if data.shape[0] < 100:
+            st.warning(f"{tenor} : trop peu de points ({data.shape[0]}).")
+            continue
+
+        X = data[features_cols]
+        y = data[target_col]
+
+        if use_saved and tenor in saved_hparams:
+            base_params = make_base_params(saved_hparams[tenor])
+        else:
+            base_params = make_base_params()
+
+        # LGBM -> SHAP -> sélection -> refit
+        model, keep_cols, shap_imp = train_lgbm_shap_select(X, y, base_params)
+        features_all[tenor] = keep_cols
+        shap_all[tenor] = shap_imp
+        models[tenor] = model
+
+        X_use = data[keep_cols]
+        X_used_all[tenor] = X_use
+
+        y_rv_hat = model.predict(X_use)
+
+        basis_level = data[basis_col]
+        ma60 = data[ma60_col]
+        fair_level = ma60 + y_rv_hat
+
+        residual = basis_level - fair_level
+        vol_resid = residual.rolling(60).std().fillna(method="bfill")
+        zscore = residual / vol_resid.replace(0, np.nan)
+
+        dfp = pd.DataFrame(
+            {
+                "basis": basis_level,
+                "fair": fair_level,
+                "residual": residual,
+                "vol_resid_60d": vol_resid,
+                "zscore": zscore,
+            },
+            index=data.index,
+        )
+        results[tenor] = dfp
+
+    if not results:
+        st.error("Aucun tenor modélisé.")
+        st.stop()
+
+    # =================== Pré-calcul metrics & derniers signaux ===================
+
+    def metrics(a, b):
+        return {
+            "RMSE": float(np.sqrt(mean_squared_error(a, b))),
+            "MAE": float(mean_absolute_error(a, b)),
+            "IC": float(np.corrcoef(a, b)[0, 1]),
+        }
+
+    metrics_by_tenor = {}
+    last_signal_by_tenor = {}
+
+    for tenor, dfp in results.items():
+        mets = metrics(dfp["basis"], dfp["fair"])
+        metrics_by_tenor[tenor] = mets
+
+        last_row = dfp.dropna().iloc[-1]
+        last_signal_by_tenor[tenor] = {
+            "z": float(last_row["zscore"]),
+            "resid": float(last_row["residual"]),
+            "date": last_row.name,
+        }
+
+    # ============================================================
+    # HMM – Régimes de marché
+    # ============================================================
+
+    regime_features = [c for c in [
+        "PC1_basis", "VIX", "MOVE",
+        "US_2s10s", "DE_2s10s",
+        "CREDIT_US", "POLICY_DIFF"
+    ] if c in df_win.columns]
+
+    regime_df = df_win[regime_features].dropna()
+
+    hmm_model = None
+    regimes_series = None
+    regime_summary = None
+
+    if regime_df.shape[0] >= 200 and len(regime_features) >= 2:
+        n_states = 3  # ex : 3 régimes
+        hmm_model = hmm.GaussianHMM(
+            n_components=n_states,
+            covariance_type="full",
+            random_state=42,
+            n_iter=200
+        )
+        X_reg = regime_df.values
+        hmm_model.fit(X_reg)
+        reg_states = hmm_model.predict(X_reg)
+
+        regimes_series = pd.Series(reg_states, index=regime_df.index, name="regime")
+
+        rows_reg = []
+        for k in range(n_states):
+            idx_k = regimes_series == k
+            sub_macro = regime_df[idx_k]
+            if sub_macro.empty:
+                continue
+
+            row = {"regime_id": k}
+            # Moyennes macro
+            for f in regime_features:
+                row[f"mean_{f}"] = sub_macro[f].mean()
+
+            # Moyenne des z-scores par tenor dans ce régime
+            for tenor, dfp in results.items():
+                z_aligned = dfp["zscore"].reindex(regimes_series.index)[idx_k]
+                row[f"mean_z_{tenor}"] = z_aligned.mean()
+
+            rows_reg.append(row)
+
+        if rows_reg:
+            regime_summary = pd.DataFrame(rows_reg).set_index("regime_id")
+
+            # Attribution d'une description automatique
+            desc = []
+            if "mean_VIX" in regime_summary.columns:
+                order_stress = regime_summary["mean_VIX"].sort_values().index.tolist()
+            else:
+                mv_col = "mean_MOVE" if "mean_MOVE" in regime_summary.columns else None
+                if mv_col:
+                    order_stress = regime_summary[mv_col].sort_values().index.tolist()
+                else:
+                    order_stress = regime_summary.index.tolist()
+
+            for k in regime_summary.index:
+                if k == order_stress[0]:
+                    label = "Regime low vol / risk-on / carry-friendly"
+                elif k == order_stress[-1]:
+                    label = "Regime high stress / risk-off / liquidity stress"
+                else:
+                    label = "Regime transition / rates & inflation repricing"
+
+                desc.append(label)
+
+            regime_summary["description"] = desc
+
+    # ============================================================
+    # TABS : Overview / Drill-down / Regimes
+    # ============================================================
+
+    tab_overview, tab_drill, tab_regimes = st.tabs(["Overview", "Drill-down", "Regimes (HMM + SHAP)"])
+
+    # ------------------------- OVERVIEW -------------------------
+    with tab_overview:
+        st.subheader("📊 Metrics & dernier signal par tenor")
+
+        rows = []
+        for tenor in results.keys():
+            m = metrics_by_tenor[tenor]
+            s = last_signal_by_tenor[tenor]
+            rows.append(
+                {
+                    "Tenor": tenor,
+                    "RMSE": m["RMSE"],
+                    "MAE": m["MAE"],
+                    "IC": m["IC"],
+                    "Last z-score": s["z"],
+                    "Last resid (bp)": s["resid"],
+                    "Last date": s["date"].date(),
+                }
+            )
+        st.dataframe(pd.DataFrame(rows).set_index("Tenor"))
+
+        st.markdown("---")
+        st.subheader("📊 Multi-charts par tenor (Basis & Signal)")
+
+        for tenor, df_t in results.items():
+            st.markdown(f"### Tenor {tenor}")
+
+            # Chart Basis vs Fair
+            fig_b, ax_b = plt.subplots(figsize=(10, 3))
+            ax_b.plot(df_t.index, df_t["basis"], label="Basis")
+            ax_b.plot(df_t.index, df_t["fair"], label="Fair value", linestyle="--")
+            ax_b.set_title(f"{tenor} – Basis vs Fair Value")
+            ax_b.grid(True)
+            ax_b.legend()
+            st.pyplot(fig_b)
+
+            # Chart Z-score
+            fig_s, ax_s = plt.subplots(figsize=(10, 2.5))
+            ax_s.plot(df_t.index, df_t["zscore"], label="Z-score")
+            ax_s.axhline(1.5, linestyle="--", label="+1.5")
+            ax_s.axhline(-1.5, linestyle="--", label="-1.5")
+            ax_s.axhline(0, linewidth=1)
+            ax_s.set_title(f"{tenor} – Signal (Z-score)")
+            ax_s.grid(True)
+            ax_s.legend()
+            st.pyplot(fig_s)
+
+        if len(results) > 1:
+            st.markdown("---")
+            st.subheader("🌡️ Heatmap multi-tenors du signal (z-score)")
+            z_mat = pd.DataFrame({tenor: df_t["zscore"] for tenor, df_t in results.items()}).sort_index()
+
+            fig3, ax3 = plt.subplots(figsize=(10, 4))
+            im = ax3.imshow(z_mat.T, aspect="auto", interpolation="nearest")
+
+            ax3.set_yticks(range(len(z_mat.columns)))
+            ax3.set_yticklabels(z_mat.columns)
+
+            if len(z_mat.index) > 1:
+                idx = np.linspace(0, len(z_mat.index) - 1, num=min(8, len(z_mat.index))).astype(int)
+                ax3.set_xticks(idx)
+                ax3.set_xticklabels(
+                    [z_mat.index[i].strftime("%Y-%m-%d") for i in idx],
+                    rotation=45,
+                    ha="right",
+                )
+
+            ax3.set_title("Heatmap du z-score par tenor")
+            fig3.colorbar(im, ax=ax3, label="z-score")
+            st.pyplot(fig3)
+
+    # ------------------------- DRILL-DOWN -------------------------
+    with tab_drill:
+        st.subheader("🔍 Drill-down sur un tenor")
+
+        tenor_sel = st.selectbox("Choisis un tenor", list(results.keys()))
+        dfp = results[tenor_sel]
+        mets = metrics_by_tenor[tenor_sel]
+        last_sig = last_signal_by_tenor[tenor_sel]
+
+        st.markdown(f"### Tenor {tenor_sel} – Metrics")
+        st.dataframe(pd.DataFrame({"Fenêtre": mets}))
+
+        st.markdown("#### Basis vs Fair Value")
+        fig, ax = plt.subplots(figsize=(10, 4))
+        ax.plot(dfp.index, dfp["basis"], label="Basis")
+        ax.plot(dfp.index, dfp["fair"], label="Fair value", linestyle="--")
+        ax.set_title(f"{tenor_sel} – Fenêtre {start_date} → {end_date}")
+        ax.grid(True)
+        ax.legend()
+        st.pyplot(fig)
+
+        st.markdown("#### Signal (Z-score)")
+        fig2, ax2 = plt.subplots(figsize=(10, 4))
+        ax2.plot(dfp.index, dfp["zscore"], label="Z-score")
+        ax2.axhline(1.5, linestyle="--", label="+1.5")
+        ax2.axhline(-1.5, linestyle="--", label="-1.5")
+        ax2.axhline(0, linewidth=1)
+        ax2.set_title(f"Z-score (basis - fair) – {tenor_sel}")
+        ax2.grid(True)
+        ax2.legend()
+        st.pyplot(fig2)
+
+        # Dernier signal + commentaire PM
+        last_z = last_sig["z"]
+        last_resid = last_sig["resid"]
+
+        if last_z <= -2.0:
+            bucket = "📉 Very cheap"
+            comment = "Le basis est extrêmement cheap vs fair value. Signal fort pour être long basis (ou réduire shorts)."
+        elif -2.0 < last_z <= -1.0:
+            bucket = "🟢 Cheap"
+            comment = "Le basis est modérément cheap. Biais long basis / réduction des shorts justifiable."
+        elif -1.0 < last_z < 1.0:
+            bucket = "⚪ Neutre"
+            comment = "Le basis est proche de sa fair value. Pas de trade directionnel fort, plutôt gestion de carry / RV cross-tenor."
+        elif 1.0 <= last_z < 2.0:
+            bucket = "🟠 Rich"
+            comment = "Le basis est modérément rich. Biais short basis / réduction des longs justifiable."
+        else:
+            bucket = "🔴 Very rich"
+            comment = "Le basis est extrêmement rich vs fair value. Signal fort pour être short basis (ou réduire longs)."
+
+        st.markdown(
+            f"**Dernier signal ({tenor_sel})**  \n"
+            f"- z-score = **{last_z:.2f}**  \n"
+            f"- résiduel = **{last_resid:.2f} bp**  \n"
+            f"- régime qualitatif = **{bucket}**"
+        )
+        st.markdown(f"**Interprétation PM :** {comment}")
+
+        # ---------- SHAP global ----------
+        st.markdown("#### SHAP global – importance moyenne des features")
+
+        shap_imp = shap_all[tenor_sel]
+        keep_cols = features_all[tenor_sel]
+        shap_imp_keep = shap_imp[keep_cols].sort_values(ascending=False).head(12)
+
+        fig_g, ax_g = plt.subplots(figsize=(8, 4))
+        ax_g.barh(range(len(shap_imp_keep.index)), shap_imp_keep.values)
+        ax_g.set_yticks(range(len(shap_imp_keep.index)))
+        ax_g.set_yticklabels(shap_imp_keep.index)
+        ax_g.invert_yaxis()
+        ax_g.set_title(f"{tenor_sel} – Top features (mean |SHAP|)")
+        ax_g.grid(True, axis="x")
+        st.pyplot(fig_g)
+
+        # ---------- SHAP local (dernière date) ----------
+        st.markdown("#### SHAP local – dernière observation")
+
+        model_loc = models[tenor_sel]
+        X_loc = X_used_all[tenor_sel]
+
+        last_x = X_loc.iloc[[-1]]
+        explainer_loc = shap.TreeExplainer(model_loc)
+        shap_vals_loc = explainer_loc.shap_values(last_x)[0]
+
+        shap_loc_series = pd.Series(shap_vals_loc, index=X_loc.columns)
+        shap_loc_top = shap_loc_series.reindex(keep_cols).sort_values(
+            key=lambda s: np.abs(s),
+            ascending=False
+        ).head(12)
+
+        fig_l, ax_l = plt.subplots(figsize=(8, 4))
+        ax_l.barh(range(len(shap_loc_top.index)), shap_loc_top.values)
+        ax_l.set_yticks(range(len(shap_loc_top.index)))
+        ax_l.set_yticklabels(shap_loc_top.index)
+        ax_l.invert_yaxis()
+        ax_l.set_title(f"{tenor_sel} – SHAP local (dernière date)")
+        ax_l.grid(True, axis="x")
+        st.pyplot(fig_l)
+
+        st.markdown(
+            "👉 Lecture : features avec SHAP positif poussent le basis **au-dessus** de la fair value, "
+            "features avec SHAP négatif le poussent **en dessous**."
+        )
+
+        # ---------- Commentaire automatique SHAP ----------
+        st.markdown("### 📝 Commentaire automatique basé sur les SHAP")
+
+        top_global = shap_imp_keep.index[:5]
+
+        top_local = shap_loc_top.index[:5]
+        top_local_sign = shap_loc_top[top_local]
+
+        pos_drivers = [f for f in top_local if top_local_sign[f] > 0]
+        neg_drivers = [f for f in top_local if top_local_sign[f] < 0]
+
+        comment_global = (
+            f"Sur le plan structurel, le modèle identifie **{', '.join(top_global)}** comme "
+            f"les principaux facteurs expliquant la formation de la fair-value du basis {tenor_sel}. "
+            f"Ces variables dominent la décomposition SHAP et capturent la dynamique macro/taux sous-jacente."
+        )
+
+        if len(pos_drivers) > 0:
+            comment_pos = (
+                f"Actuellement, le basis est poussé **au-dessus** de sa fair-value principalement par "
+                f"**{', '.join(pos_drivers)}**."
+            )
+        else:
+            comment_pos = "Aucun facteur ne pousse significativement le basis au-dessus de la fair value."
+
+        if len(neg_drivers) > 0:
+            comment_neg = (
+                f"Inversement, le basis est tiré **en-dessous** de sa fair-value par "
+                f"**{', '.join(neg_drivers)}**."
+            )
+        else:
+            comment_neg = "Aucun facteur ne tire significativement le basis en-dessous de la fair value."
+
+        summary = (
+            f"En synthèse, la combinaison de ces signaux suggère que le basis {tenor_sel} "
+            f"se situe actuellement dans un régime `{bucket}` avec un z-score de {last_z:.2f}. "
+            f"Les forces directionnelles identifiées par SHAP permettent de qualifier "
+            f"la robustesse du signal et de valider (ou non) un biais de trading."
+        )
+
+        st.markdown(f"""
+**🧠 Drivers structurels (SHAP global)**  
+{comment_global}
+
+**📍 Drivers instantanés (SHAP local – dernière date)**  
+- {comment_pos}  
+- {comment_neg}
+
+**🎯 Synthèse PM**  
+{summary}
+""")
+
+    # ------------------------- REGIMES (HMM + SHAP) -------------------------
+    with tab_regimes:
+        st.subheader("🧩 Régimes de marché (HMM)")
+
+        if (regimes_series is None) or (regime_summary is None):
+            st.warning("Pas assez de données / features pour estimer un HMM de régimes.")
+        else:
+            # 1) Graph time-series des régimes
+            st.markdown("#### Time-series des régimes")
+
+            fig_r, ax_r = plt.subplots(figsize=(10, 3))
+            ax_r.plot(regimes_series.index, regimes_series.values, drawstyle="steps-post")
+            ax_r.set_yticks(sorted(regime_summary.index))
+            ax_r.set_yticklabels([f"Regime {k}" for k in regime_summary.index])
+            ax_r.set_title("Régimes HMM – séquence temporelle")
+            ax_r.grid(True)
+            st.pyplot(fig_r)
+
+            # 2) Table d’explication des régimes
+            st.markdown("#### Table d’explication des régimes")
+
+            st.dataframe(regime_summary)
+
+            st.markdown(
+                """
+**Lecture de la table :**
+
+- Les colonnes `mean_VIX`, `mean_MOVE`, `mean_US_2s10s`, etc. résument le **profil moyen** de chaque régime.
+- Les colonnes `mean_z_1Y`, `mean_z_2Y`, etc. donnent le **z-score moyen du basis** par tenor dans ce régime :
+    - z moyen > 0 → basis tend à être **rich** dans ce régime.
+    - z moyen < 0 → basis tend à être **cheap** dans ce régime.
+- La colonne `description` fournit une **interprétation qualitative** du régime :
+    - *Regime low vol / risk-on / carry-friendly* : vol faible, courbes plus stables, basis drive par carry.
+    - *Regime high stress / risk-off / liquidity stress* : VIX/MOVE élevés, stress USD, basis distortions fréquentes.
+    - *Regime transition / rates & inflation repricing* : vol intermédiaire, moves directionnels sur les courbes.
+                """
+            )
+
+            st.markdown("#### Lien avec SHAP – drivers par tenor")
+
+            st.markdown(
+                """
+On combine les régimes HMM et les SHAP de la façon suivante :
+
+- Les régimes HMM décrivent **le contexte de marché** (stress, risk-on, transition).
+- Les SHAP (global) décrivent **quels facteurs structurent la fair value du basis** pour chaque tenor.
+
+En pratique :
+
+- On regarde dans quel régime on est actuellement (via la time-series des régimes).
+- On observe le z-score du basis dans ce régime (cheap / rich / neutre).
+- On lit les SHAP du tenor d'intérêt pour comprendre **quels drivers expliquent la fair value** (USD rates, EUR rates, FX, vol).
+
+Cela permet de construire une narrative de type hedge fund :
+
+> *“En régime 2 (stress USD), le modèle est dominé par USD 2s10s, MOVE et PC1_basis.  
+> Dans ce contexte, un z-score 5Y à +2.1 est une anomalie de richesse cohérente avec un short basis.”*
+                """
+            )
+
+    # =======================================================
+    # 7) Features retenues (SHAP) – global
+    # =======================================================
+
+    st.header("🔧 Features retenues (SHAP) – matrice tenors × features")
+    all_feats = sorted({f for cols in features_all.values() for f in cols})
+    mat = pd.DataFrame(False, index=all_feats, columns=features_all.keys())
+    for t, cols in features_all.items():
+        mat.loc[cols, t] = True
+    st.dataframe(mat)
+
+
+if __name__ == "__main__":
+    main()
+
+
+
+import numpy as np
+import pandas as pd
+from sklearn.decomposition import PCA
+
+
+INPUT_CSV = "multi_asset_full_with_macro.csv"
+OUTPUT_CSV = "multi_asset_full_with_macro_features.csv"
+
+
+def load_base_csv(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+    if "date" not in df.columns:
+        raise ValueError("Colonne 'date' manquante dans le CSV de base.")
+    # format dd/mm/yyyy
+    df["date"] = pd.to_datetime(df["date"], format="%d/%m/%Y", errors="coerce")
+    df = df.set_index("date").sort_index()
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    return df
+
+
+def add_pca_on_basis_returns(df: pd.DataFrame) -> pd.DataFrame:
+    basis_cols = [c for c in df.columns if c.startswith("EUBASIS_")]
+    if not basis_cols:
+        raise ValueError("Aucune colonne EUBASIS_ trouvée pour la PCA.")
+
+    R = df[basis_cols].diff(1).fillna(0.0)
+    pca = PCA(n_components=2, random_state=42)
+    scores = pca.fit_transform(R.values)
+
+    pcs = pd.DataFrame(
+        scores,
+        index=df.index,
+        columns=["PC1_basis", "PC2_basis"]
+    )
+
+    df = df.join(pcs, how="left")
+    return df
+
+
+def add_global_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ajoute les features globales (FX returns, etc.) qui ne dépendent pas du tenor.
+    """
+    if "EURUSD" in df.columns:
+        df["D_EURUSD_1D"] = df["EURUSD"].diff(1).fillna(0.0)
+    else:
+        df["D_EURUSD_1D"] = 0.0
+
+    if "VIX" not in df.columns:
+        df["VIX"] = 0.0
+    if "MOVE" not in df.columns:
+        df["MOVE"] = 0.0
+
+    return df
+
+
+def add_tenor_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Pour chaque tenor EUBASIS_T :
+    - SPREAD_T      = USDSWAP_T - EURSWAP_T
+    - D_BASIS_1D_T
+    - D_BASIS_5D_T
+    - VOL20_T       (vol des returns 1D)
+    - MOM_5_20_T    (diff 5J / diff 20J)
+    - BASIS_MA60_T
+    - TARGET_RV_T   = basis_T - BASIS_MA60_T
+    """
+
+    basis_cols = [c for c in df.columns if c.startswith("EUBASIS_")]
+    if not basis_cols:
+        raise ValueError("Aucune colonne EUBASIS_ trouvée pour les features tenor.")
+
+    for col in basis_cols:
+        tenor = col.replace("EUBASIS_", "")  # ex '1Y', '2Y', '5Y'
+        basis = df[col]
+
+        usd_col = f"USDSWAP_{tenor}"
+        eur_col = f"EURSWAP_{tenor}"
+
+        if usd_col not in df.columns or eur_col not in df.columns:
+            print(f"[WARN] {usd_col} ou {eur_col} manquant pour le tenor {tenor}, on skip.")
+            continue
+
+        df[f"SPREAD_{tenor}"] = df[usd_col] - df[eur_col]
+        df[f"D_BASIS_1D_{tenor}"] = basis.diff(1)
+        df[f"D_BASIS_5D_{tenor}"] = basis.diff(5)
+
+        ret_basis = basis.diff(1)
+        df[f"VOL20_{tenor}"] = ret_basis.rolling(20).std()
+
+        df[f"MOM_5_20_{tenor}"] = (
+            basis.diff(5) / basis.diff(20)
+        ).replace([np.inf, -np.inf], 0.0)
+
+        df[f"BASIS_MA60_{tenor}"] = basis.rolling(60).mean()
+        df[f"TARGET_RV_{tenor}"] = basis - df[f"BASIS_MA60_{tenor}"]
+
+    return df
+
+
+def main():
+    print(f"[INFO] Chargement du CSV de base : {INPUT_CSV}")
+    df = load_base_csv(INPUT_CSV)
+
+    print("[INFO] Ajout PCA sur les returns du basis...")
+    df = add_pca_on_basis_returns(df)
+
+    print("[INFO] Ajout des features globales (FX, VIX, MOVE)...")
+    df = add_global_features(df)
+
+    print("[INFO] Ajout des features par tenor...")
+    df = add_tenor_features(df)
+
+    print(f"[INFO] Sauvegarde du CSV enrichi : {OUTPUT_CSV}")
+    df.to_csv(OUTPUT_CSV, index=True)
+    print("[OK] Terminé.")
+
+
+if __name__ == "__main__":
+    main()
