@@ -1,0 +1,203 @@
+import pandas as pd
+import numpy as np
+from sklearn.decomposition import PCA
+
+
+# ------------------------------------------------------------------
+# CONFIG
+# ------------------------------------------------------------------
+INPUT_CSV = "multi_asset_full.csv"          # ton fichier brut
+OUTPUT_CSV = "data_with_features.csv"       # fichier enrichi
+DATE_COL = "date"                           # nom de la colonne date
+DATE_FORMAT = "%d/%m/%Y"                    # format de la date dans le CSV
+
+
+# ------------------------------------------------------------------
+# 1) LOAD & CLEAN
+# ------------------------------------------------------------------
+def load_raw_data(path: str) -> pd.DataFrame:
+    df = pd.read_csv(path)
+
+    if DATE_COL not in df.columns:
+        raise ValueError(f"Colonne date '{DATE_COL}' manquante dans {path}")
+
+    df[DATE_COL] = pd.to_datetime(df[DATE_COL], format=DATE_FORMAT, errors="coerce")
+    df = df.dropna(subset=[DATE_COL])
+    df = df.sort_values(DATE_COL).set_index(DATE_COL)
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+    return df
+
+
+# ------------------------------------------------------------------
+# 2) FEATURES PAR TENOR (basis + swaps)
+# ------------------------------------------------------------------
+def build_tenor_features(df: pd.DataFrame) -> pd.DataFrame:
+    """
+    Ajoute pour chaque tenor présent :
+      SPREAD_T      = USDSWAP_T - EURSWAP_T
+      D_BASIS_1D_T  = diff 1j du basis
+      D_BASIS_5D_T  = diff 5j du basis
+      VOL20_T       = std rolling 20j de diff 1j basis
+      BASIS_MA60_T  = moyenne mobile 60j du basis
+      MOM_5_20_T    = MA5(basis) - MA20(basis)
+      TARGET_RV_T   = basis - BASIS_MA60_T  (mean-reversion signal)
+    """
+    out = df.copy()
+
+    # Tenors détectés automatiquement
+    basis_cols = [c for c in out.columns if c.startswith("EUBASIS_")]
+    tenors = [c.replace("EUBASIS_", "") for c in basis_cols]
+
+    for t in tenors:
+        basis_col = f"EUBASIS_{t}"
+        usd_col = f"USDSWAP_{t}"
+        eur_col = f"EURSWAP_{t}"
+
+        if usd_col not in out.columns or eur_col not in out.columns:
+            print(f"[WARN] Tenor {t}: {usd_col} ou {eur_col} manquant → SPREAD non calculé.")
+        else:
+            out[f"SPREAD_{t}"] = out[usd_col] - out[eur_col]
+
+        # D1 / D5
+        out[f"D_BASIS_1D_{t}"] = out[basis_col].diff(1)
+        out[f"D_BASIS_5D_{t}"] = out[basis_col].diff(5)
+
+        # Vol 20j de diff 1j
+        out[f"VOL20_{t}"] = out[basis_col].diff(1).rolling(20).std()
+
+        # MA5 et MA20 pour le momentum
+        ma5 = out[basis_col].rolling(5).mean()
+        ma20 = out[basis_col].rolling(20).mean()
+        out[f"MOM_5_20_{t}"] = ma5 - ma20
+
+        # MA60 & target RV
+        out[f"BASIS_MA60_{t}"] = out[basis_col].rolling(60).mean()
+        out[f"TARGET_RV_{t}"] = out[basis_col] - out[f"BASIS_MA60_{t}"]
+
+    return out
+
+
+# ------------------------------------------------------------------
+# 3) PCA SUR BASIS RETURNS → PC1_basis, PC2_basis
+# ------------------------------------------------------------------
+def build_pca_basis(df: pd.DataFrame, n_components: int = 2) -> pd.DataFrame:
+    out = df.copy()
+    basis_cols = [c for c in out.columns if c.startswith("EUBASIS_")]
+
+    if len(basis_cols) < n_components:
+        print("[WARN] Pas assez de colonnes basis pour faire une PCA.")
+        return out
+
+    # returns = diff en bp
+    basis_ret = out[basis_cols].diff(1).dropna()
+
+    # standardisation
+    basis_std = (basis_ret - basis_ret.mean()) / basis_ret.std(ddof=0)
+
+    pca = PCA(n_components=n_components, random_state=42)
+    pcs = pca.fit_transform(basis_std.values)
+
+    pcs_df = pd.DataFrame(
+        pcs,
+        index=basis_std.index,
+        columns=[f"PC{i+1}_basis" for i in range(n_components)],
+    )
+
+    # réindexe sur tout le df (fwd fill) pour avoir PC1/PC2 partout
+    pcs_df = pcs_df.reindex(out.index).fillna(method="bfill")
+
+    for col in pcs_df.columns:
+        out[col] = pcs_df[col]
+
+    print("[INFO] PCA basis : variance expliquée =", pca.explained_variance_ratio_)
+    return out
+
+
+# ------------------------------------------------------------------
+# 4) MACRO FEATURES (slopes, spreads, returns, policy diff)
+# ------------------------------------------------------------------
+def add_macro_features(df: pd.DataFrame) -> pd.DataFrame:
+    out = df.copy()
+
+    # US 2s10s : si on a USGG2YR/USGG10YR, sinon USDSWAP_2Y/USDSWAP_10Y
+    if "USGG10YR" in out.columns and "USGG2YR" in out.columns:
+        out["US_2s10s"] = out["USGG10YR"] - out["USGG2YR"]
+    elif "USDSWAP_10Y" in out.columns and "USDSWAP_2Y" in out.columns:
+        out["US_2s10s"] = out["USDSWAP_10Y"] - out["USDSWAP_2Y"]
+    else:
+        print("[WARN] Impossible de construire US_2s10s (USGG/USDSWAP manquants).")
+
+    # DE 2s10s : si on a GDBR2/GDBR10, sinon EURSWAP_2Y/EURSWAP_10Y
+    if "GDBR10" in out.columns and "GDBR2" in out.columns:
+        out["DE_2s10s"] = out["GDBR10"] - out["GDBR2"]
+    elif "EURSWAP_10Y" in out.columns and "EURSWAP_2Y" in out.columns:
+        out["DE_2s10s"] = out["EURSWAP_10Y"] - out["EURSWAP_2Y"]
+    else:
+        print("[WARN] Impossible de construire DE_2s10s (GDBR/EURSWAP manquants).")
+
+    # POLICY_DIFF & ESTR_FED : Fed - ESTR ou l'inverse
+    if "FEDFUNDS" in out.columns and "ESTR" in out.columns:
+        out["POLICY_DIFF"] = out["FEDFUNDS"] - out["ESTR"]
+        out["ESTR_FED"] = out["ESTR"] - out["FEDFUNDS"]
+    else:
+        print("[WARN] Impossible de construire POLICY_DIFF / ESTR_FED (FEDFUNDS/ESTR manquants).")
+
+    # CREDIT_US : ex CDX IG
+    if "CDX_IG" in out.columns:
+        out["CREDIT_US"] = out["CDX_IG"]
+    else:
+        print("[WARN] CREDIT_US non construit (CDX_IG manquant).")
+
+    # CREDIT_EUR_US : différentiel iTraxx - CDX
+    if "ITRAXX_MAIN" in out.columns and "CDX_IG" in out.columns:
+        out["CREDIT_EUR_US"] = out["ITRAXX_MAIN"] - out["CDX_IG"]
+    else:
+        print("[WARN] CREDIT_EUR_US non construit (ITRAXX_MAIN/CDX_IG manquants).")
+
+    # Retours 1j sur USGG10YR / GDBR10 (ou fallback sur swaps 10Y)
+    if "USGG10YR" in out.columns:
+        out["USGG10YR_ret_1d"] = out["USGG10YR"].diff(1)
+    elif "USDSWAP_10Y" in out.columns:
+        out["USGG10YR_ret_1d"] = out["USDSWAP_10Y"].diff(1)
+    else:
+        print("[WARN] USGG10YR_ret_1d non construit (USGG10YR/USDSWAP_10Y manquants).")
+
+    if "GDBR10" in out.columns:
+        out["GDBR10_ret_1d"] = out["GDBR10"].diff(1)
+    elif "EURSWAP_10Y" in out.columns:
+        out["GDBR10_ret_1d"] = out["EURSWAP_10Y"].diff(1)
+    else:
+        print("[WARN] GDBR10_ret_1d non construit (GDBR10/EURSWAP_10Y manquants).")
+
+    # VIX / MOVE : si déjà dans le CSV on ne fait que les laisser
+    if "VIX" not in out.columns:
+        print("[WARN] VIX non présent dans le CSV brut.")
+    if "MOVE" not in out.columns:
+        print("[WARN] MOVE non présent dans le CSV brut.")
+
+    return out
+
+
+# ------------------------------------------------------------------
+# MAIN
+# ------------------------------------------------------------------
+def main():
+    print(f"[INFO] Chargement du fichier brut : {INPUT_CSV}")
+    df = load_raw_data(INPUT_CSV)
+
+    print("[INFO] Construction des features par tenor...")
+    df = build_tenor_features(df)
+
+    print("[INFO] PCA sur les returns de basis...")
+    df = build_pca_basis(df, n_components=2)
+
+    print("[INFO] Construction des features macro...")
+    df = add_macro_features(df)
+
+    print(f"[INFO] Sauvegarde du fichier enrichi : {OUTPUT_CSV}")
+    df.to_csv(OUTPUT_CSV, index=True)
+    print("[DONE] Features créées et CSV écrit.")
+
+
+if __name__ == "__main__":
+    main()
