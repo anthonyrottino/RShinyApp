@@ -1,0 +1,495 @@
+# ============================================================
+#          EURUSD BASIS – FAIR VALUE + HMM MASTER TABLE
+# ============================================================
+
+import numpy as np
+import pandas as pd
+import streamlit as st
+
+from sklearn.metrics import mean_squared_error, mean_absolute_error
+from lightgbm import LGBMRegressor
+import shap
+import matplotlib.pyplot as plt
+import matplotlib.patches as mpatches
+from hmmlearn import hmm
+import json
+import os
+
+
+# ============================================================
+# 0) PAGE CONFIG – LARGE LAYOUT
+# ============================================================
+
+st.set_page_config(
+    page_title="EURUSD Basis – Fair Value",
+    layout="wide",
+    initial_sidebar_state="expanded",
+)
+
+HYPERPARAMS_FILE = "lgbm_best_params_per_tenor.json"
+
+
+# ============================================================
+# 1) UTILS – Hyperparams + LGBM+SHAP Selection
+# ============================================================
+
+def load_saved_hyperparams():
+    if os.path.exists(HYPERPARAMS_FILE):
+        with open(HYPERPARAMS_FILE, "r") as f:
+            return json.load(f)
+    return {}
+
+
+def make_base_params(saved_params=None):
+    base = dict(
+        learning_rate=0.03,
+        num_leaves=31,
+        max_depth=4,
+        n_estimators=300,
+        subsample=0.8,
+        colsample_bytree=0.8,
+        min_child_samples=20,
+    )
+    if saved_params is not None:
+        base.update(saved_params)
+
+    base.update(
+        reg_lambda=5.0,
+        reg_alpha=1.0,
+        random_state=42,
+        n_jobs=-1,
+    )
+    return base
+
+
+def train_lgbm_shap_select(X, y, base_params):
+    """
+    1) Entraîne un LGBM sur tous les features
+    2) Calcule SHAP global
+    3) Garde ~95% de la masse SHAP (+ PC1/PC2 si présents)
+    4) Refit un modèle final sur ce sous-ensemble.
+    """
+    model_full = LGBMRegressor(**base_params)
+    model_full.fit(X, y)
+
+    explainer = shap.TreeExplainer(model_full)
+    Xs = X.sample(min(800, len(X)), random_state=42)
+    shap_vals = explainer.shap_values(Xs)
+
+    shap_abs = np.abs(shap_vals).mean(axis=0)
+    shap_importances = pd.Series(shap_abs, index=X.columns).sort_values(ascending=False)
+
+    total = shap_importances.sum()
+    cum = 0.0
+    keep = []
+    for col, v in shap_importances.items():
+        keep.append(col)
+        cum += v
+        if cum / total >= 0.95:
+            break
+
+    for m in ["PC1_basis", "PC2_basis"]:
+        if m in X.columns and m not in keep:
+            keep.append(m)
+
+    model_final = LGBMRegressor(**base_params)
+    model_final.fit(X[keep], y)
+
+    return model_final, keep, shap_importances
+
+
+# ============================================================
+# 2) GRAPH Z-SCORE + REGIME BACKGROUND (mini HMM block)
+# ============================================================
+
+def plot_zscore_with_hmm_background(dfp, regimes, tenor_label):
+    """
+    dfp : DataFrame avec 'zscore'
+    regimes : Series indexée par date avec états HMM (0,1,2…)
+    """
+    z = dfp["zscore"].dropna()
+    reg = regimes.reindex(z.index).dropna()
+
+    if z.empty or reg.empty:
+        st.warning("Not enough common data for z-score + HMM plot.")
+        return
+
+    common = z.index.intersection(reg.index)
+    z = z.reindex(common)
+    reg = reg.reindex(common)
+
+    fig, ax = plt.subplots(figsize=(14, 4))
+    ax.plot(z.index, z.values, label="Z-score", linewidth=1.4)
+
+    unique_states = sorted(reg.unique())
+    colors = ["#e0f3db", "#fee0b6", "#fbb4ae", "#c6dbef", "#f2f2f2"]
+    cmap = {s: colors[i % len(colors)] for i, s in enumerate(unique_states)}
+
+    current = reg.iloc[0]
+    start = reg.index[0]
+
+    for t, s in zip(reg.index[1:], reg.iloc[1:]):
+        if s != current:
+            ax.axvspan(start, t, color=cmap[current], alpha=0.25)
+            start = t
+            current = s
+    ax.axvspan(start, reg.index[-1], color=cmap[current], alpha=0.25)
+
+    ax.axhline(0, color="grey", linestyle="--")
+    ax.grid(True)
+    ax.set_title(f"{tenor_label} – Z-score with HMM regimes")
+    ax.set_ylabel("z-score")
+
+    patches = [mpatches.Patch(color=cmap[s], label=f"Regime {s}") for s in unique_states]
+    ax.legend(handles=[ax.lines[0]] + patches, loc="upper left")
+
+    st.pyplot(fig)
+
+
+# ============================================================
+# 3) MAIN APP
+# ============================================================
+
+def main():
+    st.title("📈 EURUSD Basis – Fair Value (LGBM + HMM-integrated Signal)")
+
+    uploaded = st.file_uploader("Upload data_with_features.csv", type=["csv"])
+    if uploaded is None:
+        st.stop()
+
+    df = pd.read_csv(uploaded)
+    if "date" not in df.columns:
+        st.error("Missing 'date' column.")
+        st.stop()
+
+    df["date"] = pd.to_datetime(df["date"], format="%d/%m/%Y", errors="coerce")
+    df = df.dropna(subset=["date"])
+    df = df.set_index("date").sort_index()
+    df = df.loc[:, ~df.columns.str.startswith("Unnamed")]
+
+    saved_hparams = load_saved_hyperparams()
+
+    # -------- Date window --------
+    min_d = df.index.min().date()
+    max_d = df.index.max().date()
+
+    col1, col2 = st.columns(2)
+    with col1:
+        start = st.date_input("Start date", min_d)
+    with col2:
+        end = st.date_input("End date", max_d)
+
+    if start > end:
+        st.error("Start date > End date.")
+        st.stop()
+
+    dfw = df.loc[str(start):str(end)]
+    if dfw.empty:
+        st.error("Empty window after date filter.")
+        st.stop()
+
+    st.info(f"Window: {dfw.index[0].date()} → {dfw.index[-1].date()} ({len(dfw)} points)")
+
+    # -------- Tenors --------
+    basis_cols = [c for c in dfw.columns if c.startswith("EUBASIS_")]
+    if not basis_cols:
+        st.error("No EUBASIS_ columns.")
+        st.stop()
+
+    tenors = sorted(c.replace("EUBASIS_", "") for c in basis_cols)
+
+    sel_tenors = st.multiselect(
+        "Select tenors",
+        tenors,
+        default=["1Y", "2Y", "5Y", "10Y"] if set(["1Y", "2Y", "5Y", "10Y"]).issubset(tenors) else tenors,
+    )
+    if not sel_tenors:
+        st.stop()
+
+    use_saved = st.checkbox("Use saved hyperparameters (if available)", True)
+
+    if st.button("🚀 Run model"):
+        st.session_state["run"] = True
+    if "run" not in st.session_state:
+        st.stop()
+
+    # ============================================================
+    #           LGBM MODELLING PER TENOR
+    # ============================================================
+
+    results = {}      # tenor -> df(basis,fair,zscore...)
+    models = {}
+    features_all = {}
+
+    macro_cols = [
+        "US_2s10s", "DE_2s10s", "POLICY_DIFF", "CREDIT_US",
+        "CREDIT_EUR_US", "ESTR_FED", "USGG10YR_ret_1d", "GDBR10_ret_1d",
+    ]
+
+    for tenor in sel_tenors:
+        st.subheader(f"Tenor {tenor}")
+
+        target = f"TARGET_RV_{tenor}"
+        basis_col = f"EUBASIS_{tenor}"
+        usd = f"USDSWAP_{tenor}"
+        eur = f"EURSWAP_{tenor}"
+        spread = f"SPREAD_{tenor}"
+        d1 = f"D_BASIS_1D_{tenor}"
+        d5 = f"D_BASIS_5D_{tenor}"
+        vol = f"VOL20_{tenor}"
+        mom = f"MOM_5_20_{tenor}"
+        ma60 = f"BASIS_MA60_{tenor}"
+
+        required = [
+            target, basis_col, usd, eur, spread, d1, d5, vol, mom, ma60,
+            "PC1_basis", "PC2_basis", "EURUSD", "D_EURUSD_1D", "VIX", "MOVE"
+        ]
+
+        missing = [c for c in required if c not in dfw.columns]
+        if missing:
+            st.warning(f"{tenor} – missing columns: {missing}")
+            continue
+
+        available_macro = [c for c in macro_cols if c in dfw.columns]
+
+        data = dfw[required + available_macro].dropna()
+        if len(data) < 100:
+            st.warning(f"{tenor} – not enough points ({len(data)}).")
+            continue
+
+        features = [
+            usd, eur, spread, d1, d5, vol, mom,
+            "PC1_basis", "PC2_basis",
+            "EURUSD", "D_EURUSD_1D", "VIX", "MOVE"
+        ] + available_macro
+
+        X = data[features]
+        y = data[target]
+
+        if use_saved and tenor in saved_hparams:
+            params = make_base_params(saved_hparams[tenor])
+        else:
+            params = make_base_params()
+
+        model, keep, _ = train_lgbm_shap_select(X, y, params)
+        models[tenor] = model
+        features_all[tenor] = keep
+
+        X_use = X[keep]
+        y_hat = model.predict(X_use)
+
+        fair = data[ma60] + y_hat
+        resid = data[basis_col] - fair
+        vol_resid = resid.rolling(60).std().fillna(method="bfill")
+        z = resid / vol_resid.replace(0, np.nan)
+
+        dfp = pd.DataFrame(
+            {
+                "basis": data[basis_col],
+                "fair": fair,
+                "residual": resid,
+                "vol_resid_60d": vol_resid,
+                "zscore": z,
+            },
+            index=data.index,
+        )
+        results[tenor] = dfp
+
+    if not results:
+        st.error("No tenor successfully modelled.")
+        st.stop()
+
+    # ============================================================
+    #           HMM ON MACRO FEATURES
+    # ============================================================
+
+    regime_feats = [c for c in [
+        "PC1_basis", "VIX", "MOVE", "US_2s10s", "DE_2s10s", "CREDIT_US", "POLICY_DIFF"
+    ] if c in dfw.columns]
+
+    reg_df = dfw[regime_feats].dropna()
+    use_hmm = True
+
+    if len(reg_df) < 200 or len(regime_feats) < 2:
+        st.warning("Not enough data/features for HMM – master table will not include HMM columns.")
+        use_hmm = False
+        regimes = None
+        trans_mat = None
+        reg_descr_map = {}
+        stress_regime = None
+    else:
+        hmm_model = hmm.GaussianHMM(
+            n_components=3,
+            covariance_type="full",
+            n_iter=200,
+            random_state=42
+        )
+        hmm_model.fit(reg_df.values)
+        states = hmm_model.predict(reg_df.values)
+        regimes = pd.Series(states, index=reg_df.index, name="regime")
+        trans_mat = hmm_model.transmat_
+        n_states = trans_mat.shape[0]
+
+        # Déterminer le régime "stress" via VIX ou MOVE
+        vix_means = {}
+        for k in range(n_states):
+            idx_k = states == k
+            sub_k = reg_df.iloc[idx_k]
+            if "VIX" in reg_df.columns:
+                vix_means[k] = sub_k["VIX"].mean()
+            elif "MOVE" in reg_df.columns:
+                vix_means[k] = sub_k["MOVE"].mean()
+            else:
+                vix_means[k] = 0.0
+
+        stress_regime = max(vix_means, key=vix_means.get)
+
+        # Label qualitatif par ordre de stress
+        sorted_by_stress = sorted(vix_means.items(), key=lambda x: x[1])
+        low_reg = sorted_by_stress[0][0]
+        high_reg = sorted_by_stress[-1][0]
+        mid_reg_list = [k for k in range(n_states) if k not in [low_reg, high_reg]]
+
+        reg_descr_map = {}
+        for k in range(n_states):
+            if k == low_reg:
+                reg_descr_map[k] = "Low vol / risk-on / carry-friendly"
+            elif k == high_reg:
+                reg_descr_map[k] = "High stress / risk-off / USD liq. stress"
+            else:
+                reg_descr_map[k] = "Transition / rates & inflation repricing"
+
+    # ============================================================
+    #           MASTER TABLE: SIGNAL + HMM
+    # ============================================================
+
+    rows_master = []
+
+    for tenor, dfp in results.items():
+        dfp_nonan = dfp.dropna(subset=["zscore", "residual"])
+        if dfp_nonan.empty:
+            continue
+
+        last = dfp_nonan.iloc[-1]
+        last_date = last.name
+        z = float(last["zscore"])
+        resid = float(last["residual"])
+
+        regime_col = None
+        regime_descr = ""
+        p_stay = np.nan
+        p_to_stress = np.nan
+        z_eff = z
+        trade_flag = "NO"
+
+        if use_hmm:
+            reg_sub = regimes.loc[:last_date]
+            if not reg_sub.empty:
+                reg_curr = int(reg_sub.iloc[-1])
+                regime_col = reg_curr
+                regime_descr = reg_descr_map.get(reg_curr, "")
+
+                p_stay = float(trans_mat[reg_curr, reg_curr])
+                if stress_regime is not None and stress_regime != reg_curr:
+                    p_to_stress = float(trans_mat[reg_curr, stress_regime])
+                else:
+                    p_to_stress = 0.0
+
+                # Z-score effectif pondéré par persistance & risque de stress
+                z_eff = z * p_stay * (1.0 - p_to_stress)
+
+                # Règle simple de trade
+                threshold = 1.5
+                trade_flag = "YES" if abs(z_eff) > threshold else "NO"
+            else:
+                trade_flag = "NO"
+        else:
+            # Pas de HMM : on peut décider de trader uniquement sur z brut
+            threshold = 1.5
+            trade_flag = "YES" if abs(z) > threshold else "NO"
+
+        rows_master.append(
+            {
+                "Tenor": tenor,
+                "Last date": last_date.date(),
+                "Last z": z,
+                "Residual (bp)": resid,
+                "Regime": regime_col,
+                "Regime descr": regime_descr,
+                "p_stay": p_stay,
+                "p_to_stress": p_to_stress,
+                "z_eff": z_eff,
+                "Trade?": trade_flag,
+            }
+        )
+
+    master_table = pd.DataFrame(rows_master).set_index("Tenor")
+
+    st.header("🧩 Master Table – Signal + HMM-integrated View")
+    st.dataframe(master_table.round(3), use_container_width=True)
+
+    # ============================================================
+    #           GRAPHS – BASIS VS FAIR & Z-SCORE
+    # ============================================================
+
+    st.markdown("---")
+    st.header("📈 Drill-down Graphs")
+
+    tenor_sel = st.selectbox("Select tenor for graphs", list(results.keys()))
+    dfp_sel = results[tenor_sel]
+
+    # Basis vs Fair
+    st.subheader(f"{tenor_sel} – Basis vs Fair Value")
+    fig1, ax1 = plt.subplots(figsize=(14, 4))
+    ax1.plot(dfp_sel.index, dfp_sel["basis"], label="Basis")
+    ax1.plot(dfp_sel.index, dfp_sel["fair"], label="Fair Value", linestyle="--")
+    ax1.grid(True)
+    ax1.legend()
+    st.pyplot(fig1)
+
+    # Z-score
+    st.subheader(f"{tenor_sel} – Z-score")
+    fig2, ax2 = plt.subplots(figsize=(14, 4))
+    ax2.plot(dfp_sel.index, dfp_sel["zscore"])
+    ax2.axhline(0, color="grey")
+    ax2.axhline(1.5, linestyle="--", color="red")
+    ax2.axhline(-1.5, linestyle="--", color="red")
+    ax2.grid(True)
+    st.pyplot(fig2)
+
+    # ============================================================
+    #           MINI HMM BLOCK – TIME SERIES + MATRIX + Z+HMM
+    # ============================================================
+
+    st.markdown("---")
+    st.header("📉 Mini HMM Block (macro regime context)")
+
+    if not use_hmm:
+        st.warning("HMM not available (not enough data/features).")
+    else:
+        # HMM time series
+        st.subheader("HMM Regimes Time Series")
+        fig_r, ax_r = plt.subplots(figsize=(16, 3.5))
+        ax_r.plot(regimes.index, regimes.values, drawstyle="steps-post")
+        ax_r.set_yticks(sorted(regimes.unique()))
+        ax_r.set_yticklabels([f"Regime {k}" for k in sorted(regimes.unique())])
+        ax_r.grid(True)
+        st.pyplot(fig_r)
+
+        # Z-score + background
+        st.subheader(f"{tenor_sel} – Z-score with HMM background")
+        plot_zscore_with_hmm_background(dfp_sel, regimes, tenor_sel)
+
+        # Transition matrix
+        st.subheader("HMM Transition Matrix")
+        n_states = trans_mat.shape[0]
+        trans_df = pd.DataFrame(
+            trans_mat,
+            index=[f"Regime {k}" for k in range(n_states)],
+            columns=[f"Regime {k}" for k in range(n_states)],
+        )
+        st.dataframe(trans_df.style.format("{:.2f}"), use_container_width=True)
+
+
+if __name__ == "__main__":
+    main()
