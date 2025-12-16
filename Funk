@@ -1,0 +1,147 @@
+def backtest_all_tenors_pca_with_tradelog_by_tenor(
+    model,
+    z_window=60,
+    ewma_span=20,
+    delta_size=10000.0,
+    z_entry=1.5,
+    z_exit=0.5,
+    hedge_cost_per_bp=0.20,
+):
+    """
+    Returns:
+      perf_df   : per-tenor metrics (index=Tenor)
+      pnl_df    : per-tenor daily net pnl series (columns=Tenor)
+      trade_logs: dict {tenor: trade_log_df_for_that_tenor}
+
+    Trade log columns (per tenor):
+      Date, Tenor, Direction, Trade (Δ), Level t-1, Level t,
+      Exposure Δ (cum), PnL gross, PnL gross cum,
+      Hedge cost, PnL net, PnL net cum
+
+    Notes:
+      - PnL gross uses EXPOSURE AT t (requested):
+            (Level_t - Level_{t-1}) * Exposure_t
+      - Hedge cost uses turnover:
+            hedge_cost_per_bp * |Trade(Δ)|
+    """
+    residuals = model["residuals"]
+    levels = model["levels"]
+
+    pnl_curves = {}
+    perf_rows = []
+    trade_logs = {}
+
+    for tenor in residuals.columns:
+        res = residuals[tenor].dropna()
+        lvl = levels[tenor].reindex(res.index).dropna()
+
+        idx = res.index.intersection(lvl.index)
+        res = res.loc[idx]
+        lvl = lvl.loc[idx]
+        if len(res) < max(80, z_window + 20):
+            continue
+
+        # Signals
+        z_raw = (res - res.rolling(z_window).mean()) / (res.rolling(z_window).std() + 1e-12)
+        z_ewma = z_raw.ewm(span=int(ewma_span), adjust=False).mean()
+
+        # Position series
+        pos = 0.0
+        pos_series = []
+        trade_series = []
+        dir_series = []
+
+        for date in idx:
+            prev_pos = pos
+
+            zr = z_raw.loc[date]
+            ze = z_ewma.loc[date]
+            zr = float(zr) if pd.notna(zr) else np.nan
+            ze = float(ze) if pd.notna(ze) else np.nan
+
+            new_pos = pos
+
+            # EXIT on raw z
+            if np.isfinite(zr) and abs(zr) <= z_exit:
+                new_pos = 0.0
+            else:
+                # ENTRY on EWMA z
+                if np.isfinite(ze) and ze >= z_entry:
+                    new_pos = -float(delta_size)
+                elif np.isfinite(ze) and ze <= -z_entry:
+                    new_pos = +float(delta_size)
+
+            trade = new_pos - prev_pos
+            pos = new_pos
+
+            if pos > 0:
+                d = "BUY"
+            elif pos < 0:
+                d = "SELL"
+            else:
+                d = "FLAT"
+
+            pos_series.append(pos)
+            trade_series.append(trade)
+            dir_series.append(d)
+
+        bt = pd.DataFrame(index=idx)
+        bt["Level t"] = lvl.values
+        bt["Level t-1"] = bt["Level t"].shift(1)
+        bt["Direction"] = dir_series
+        bt["Trade (Δ)"] = trade_series
+        bt["Exposure Δ (cum)"] = pos_series
+
+        # PnL with exposure at t
+        bt["PnL gross"] = (bt["Level t"] - bt["Level t-1"]) * bt["Exposure Δ (cum)"]
+        bt["PnL gross"] = bt["PnL gross"].fillna(0.0)
+        bt["PnL gross cum"] = bt["PnL gross"].cumsum()
+
+        # Hedge cost on turnover
+        bt["Hedge cost"] = hedge_cost_per_bp * bt["Trade (Δ)"].abs()
+        bt["Hedge cost"] = bt["Hedge cost"].fillna(0.0)
+
+        bt["PnL net"] = bt["PnL gross"] - bt["Hedge cost"]
+        bt["PnL net cum"] = bt["PnL net"].cumsum()
+
+        # Store daily net pnl curve
+        pnl_curves[tenor] = bt["PnL net"]
+
+        # Perf metrics
+        s = bt["PnL net"]
+        sharpe = (s.mean() / (s.std() + 1e-12) * np.sqrt(252)) if s.std() > 0 else 0.0
+        maxdd = (bt["PnL net cum"] - bt["PnL net cum"].cummax()).min()
+
+        perf_rows.append({
+            "Tenor": tenor,
+            "FinalPnL_net": float(bt["PnL net cum"].iloc[-1]),
+            "Sharpe_net": float(sharpe),
+            "MaxDD_net": float(maxdd),
+            "#Trades": int((bt["Trade (Δ)"] != 0).sum()),
+            "LastPosΔ": float(bt["Exposure Δ (cum)"].iloc[-1]),
+            "LastZ_raw": float(z_raw.dropna().iloc[-1]) if z_raw.dropna().size else np.nan,
+        })
+
+        # Build per-tenor trade log with Date + Tenor columns
+        log = bt[[
+            "Direction", "Trade (Δ)",
+            "Level t-1", "Level t",
+            "Exposure Δ (cum)",
+            "PnL gross", "PnL gross cum",
+            "Hedge cost",
+            "PnL net", "PnL net cum"
+        ]].copy()
+
+        log.insert(0, "Date", log.index)
+        log.insert(1, "Tenor", tenor)
+
+        # reset index for pretty display
+        trade_logs[tenor] = log.reset_index(drop=True)
+
+    if not perf_rows:
+        raise ValueError("No tenor could be backtested (too short / too many NaNs).")
+
+    perf_df = pd.DataFrame(perf_rows).set_index("Tenor").sort_values("Sharpe_net", ascending=False)
+    pnl_df = pd.DataFrame(pnl_curves).fillna(0.0)
+
+    return perf_df, pnl_df, trade_logs
