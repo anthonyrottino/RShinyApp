@@ -1,0 +1,207 @@
+# =========================================================
+# IMPORTS
+# =========================================================
+import numpy as np
+import pandas as pd
+import streamlit as st
+import matplotlib.pyplot as plt
+from sklearn.decomposition import PCA
+
+# =========================================================
+# UTILS
+# =========================================================
+def tenor_to_years(col: str):
+    t = col.split("_")[-1].upper()
+    if t.endswith("M"):
+        return float(t.replace("M", "")) / 12
+    if t.endswith("Y"):
+        return float(t.replace("Y", ""))
+    return np.nan
+
+
+def build_curve_dict(df: pd.DataFrame):
+    curves = {}
+    for prefix in ["EURS WAP", "USD SWAP", "EUBASIS"]:
+        cols = [c for c in df.columns if prefix.replace(" ", "") in c]
+        if len(cols) >= 3:
+            tmp = df[cols].dropna()
+            mats = [tenor_to_years(c) for c in cols]
+            curves[prefix] = tmp.set_axis(mats, axis=1).sort_index(axis=1)
+    return curves
+
+
+# =========================================================
+# PCA CORE
+# =========================================================
+def run_curve_pca_on_returns(df_curve, k=3):
+    returns = df_curve.diff().dropna()
+    pca = PCA(n_components=k)
+    scores = pca.fit_transform(returns.values)
+    recon_ret = pca.inverse_transform(scores)
+
+    recon_level = pd.DataFrame(
+        recon_ret,
+        index=returns.index,
+        columns=returns.columns
+    ).cumsum() + df_curve.loc[returns.index[0]]
+
+    return {
+        "returns": returns,
+        "levels": df_curve.loc[returns.index],
+        "reconstructed": recon_level,
+        "eigenvectors": pca.components_,
+        "explained": pca.explained_variance_ratio_,
+    }
+
+
+def reconstruct_one_date(model, date):
+    lvl = model["levels"].loc[date]
+    rec = model["reconstructed"].loc[date]
+    resid = lvl - rec
+    z = (resid - resid.mean()) / resid.std()
+
+    return pd.DataFrame({
+        "Actual": lvl,
+        "Reconstructed": rec,
+        "Residual": resid,
+        "Residual_z": z
+    })
+
+
+# =========================================================
+# Z-SCORE + BACKTEST
+# =========================================================
+def backtest_all_tenors(
+    model,
+    z_window=60,
+    ewma_span=20,
+    delta=10_000,
+    z_entry=1.5,
+    hedge_cost_bp=0.20
+):
+    levels = model["levels"]
+    recon = model["reconstructed"]
+    resid = levels - recon
+
+    z_raw = (resid - resid.rolling(z_window).mean()) / resid.rolling(z_window).std()
+    z_ewma = z_raw.ewm(span=ewma_span, adjust=False).mean()
+
+    pnl_curves = {}
+    trades = []
+
+    for tenor in resid.columns:
+        pos = 0
+        pnl = []
+        hedge_cost = []
+        pos_hist = []
+
+        for t in range(1, len(resid)):
+            dz = resid.iloc[t][tenor] - resid.iloc[t-1][tenor]
+            zt = z_ewma.iloc[t][tenor]
+
+            if pos == 0:
+                if zt >= z_entry:
+                    pos = -delta
+                elif zt <= -z_entry:
+                    pos = +delta
+            elif abs(zt) < 0.5:
+                pos = 0
+
+            pnl.append(pos * dz)
+            hedge_cost.append(abs(pos) * hedge_cost_bp * abs(dz) / 10_000)
+            pos_hist.append(pos)
+
+        pnl_series = pd.Series(pnl, index=resid.index[1:])
+        net_pnl = pnl_series - pd.Series(hedge_cost, index=resid.index[1:])
+        pnl_curves[tenor] = net_pnl
+
+        trades.append({
+            "Tenor": tenor,
+            "Total PnL": net_pnl.sum(),
+            "Sharpe": net_pnl.mean() / net_pnl.std() * np.sqrt(252),
+            "Last Z": z_ewma.iloc[-1][tenor]
+        })
+
+    return (
+        pd.DataFrame(trades).set_index("Tenor"),
+        pd.DataFrame(pnl_curves),
+        z_ewma
+    )
+
+
+# =========================================================
+# TAB 1 — STREAMLIT
+# =========================================================
+with tab1:
+    st.header("1️⃣ Curve PCA — Swaps RV & Backtest")
+
+    uploaded = st.file_uploader("Upload multi_asset_full.csv", type="csv")
+    if uploaded is None:
+        st.stop()
+
+    df = pd.read_csv(uploaded, parse_dates=["date"], dayfirst=True).set_index("date")
+
+    curves = build_curve_dict(df)
+    curve_name = st.selectbox("Courbe à analyser", list(curves.keys()))
+    df_curve = curves[curve_name]
+
+    st.subheader("Courbe sélectionnée")
+    st.dataframe(df_curve.tail())
+
+    k = st.slider("Nombre de facteurs PCA", 1, 5, 3)
+    model = run_curve_pca_on_returns(df_curve, k=k)
+
+    # =====================
+    # LOADINGS
+    # =====================
+    st.subheader("PCA Loadings")
+    fig, ax = plt.subplots()
+    for i, ev in enumerate(model["eigenvectors"]):
+        ax.plot(df_curve.columns, ev, marker="o", label=f"PC{i+1}")
+    ax.legend(); ax.grid(True)
+    st.pyplot(fig)
+
+    # =====================
+    # ONE DATE RECON
+    # =====================
+    date_sel = st.selectbox("Date à analyser", model["levels"].index[::-1])
+    table = reconstruct_one_date(model, date_sel)
+
+    st.subheader("Reconstruction — One Date")
+    st.dataframe(table.style.background_gradient(cmap="coolwarm", subset=["Residual_z"]))
+
+    fig2, ax2 = plt.subplots()
+    ax2.plot(table.index, table["Actual"], label="Actual", marker="o")
+    ax2.plot(table.index, table["Reconstructed"], label="Reconstructed", marker="x")
+    ax2.legend(); ax2.grid(True)
+    st.pyplot(fig2)
+
+    # =====================
+    # BACKTEST
+    # =====================
+    st.subheader("RV Backtest — All Tenors")
+
+    z_win = st.slider("Z-score window", 20, 120, 60)
+    ewma = st.slider("EWMA span", 5, 60, 20)
+
+    if st.button("Run backtest"):
+        perf, pnl, z = backtest_all_tenors(
+            model,
+            z_window=z_win,
+            ewma_span=ewma
+        )
+
+        st.dataframe(perf)
+
+        fig3, ax3 = plt.subplots(figsize=(10, 4))
+        pnl.cumsum().plot(ax=ax3)
+        ax3.set_title("Cumulative PnL — All Tenors")
+        ax3.grid(True)
+        st.pyplot(fig3)
+
+        st.subheader("Z-score (EWMA)")
+        fig4, ax4 = plt.subplots(figsize=(10, 4))
+        z.plot(ax=ax4, alpha=0.7)
+        ax4.axhline(1.5, ls="--"); ax4.axhline(-1.5, ls="--")
+        ax4.grid(True)
+        st.pyplot(fig4)
