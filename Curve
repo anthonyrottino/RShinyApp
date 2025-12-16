@@ -1,0 +1,470 @@
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import streamlit as st
+
+
+# =========================================================
+# Helpers: tenor parsing + curve extraction
+# =========================================================
+
+def tenor_to_years_from_label(t: str) -> float:
+    """Convert '3M','6M','1Y','2Y','5Y','10Y','30Y' -> years float."""
+    t = str(t).strip().upper()
+    if t.endswith("M"):
+        return float(t.replace("M", "")) / 12.0
+    if t.endswith("Y"):
+        return float(t.replace("Y", ""))
+    return np.nan
+
+
+def parse_tenor_from_col(col: str) -> str | None:
+    """
+    For columns like 'EURSWAP_5Y' returns '5Y'.
+    Returns None if not matching.
+    """
+    if not isinstance(col, str):
+        return None
+    s = col.upper().strip()
+    if "_" not in s:
+        return None
+    t = s.split("_")[-1]
+    if t.endswith("M") or t.endswith("Y"):
+        # validate numeric part
+        num = t[:-1]
+        if num.isdigit():
+            return t
+    return None
+
+
+def build_swap_curve_dict(df: pd.DataFrame) -> dict[str, pd.DataFrame]:
+    """
+    Return dict: {'EURSWAP': levels_df, 'USDSWAP': levels_df, 'GBPSWAP': levels_df, ...}
+    where levels_df columns are maturities in YEARS (float), values are levels in bp.
+    """
+    out = {}
+    if df is None or df.empty:
+        return out
+
+    # candidate prefixes
+    prefixes = ["EURSWAP", "USDSWAP", "GBPSWAP", "EUBASIS", "EUINF", "GBPINFL"]
+
+    for pref in prefixes:
+        cols = [c for c in df.columns if isinstance(c, str) and c.upper().startswith(pref + "_")]
+        if not cols:
+            continue
+
+        tenors = []
+        keep_cols = []
+        for c in cols:
+            t = parse_tenor_from_col(c)
+            if t is None:
+                continue
+            y = tenor_to_years_from_label(t)
+            if np.isfinite(y):
+                tenors.append(y)
+                keep_cols.append(c)
+
+        if len(keep_cols) < 3:
+            continue
+
+        tmp = df[keep_cols].copy()
+        tmp.columns = tenors  # maturities in years
+        tmp = tmp.loc[:, sorted(tmp.columns)]
+        out[pref] = tmp
+
+    return out
+
+
+# =========================================================
+# PCA on returns (no sklearn dependency)
+# =========================================================
+
+def run_curve_pca_on_returns(levels_df: pd.DataFrame, n_components: int = 3) -> dict:
+    """
+    PCA estimated on daily returns (diff of levels).
+    Returns a model dict with keys needed downstream: levels, returns, eigenvectors, mean, explained_variance.
+    """
+    levels = levels_df.copy().sort_index()
+    levels = levels.dropna(axis=1, how="all")
+    levels = levels.dropna(how="all")
+    if levels.shape[1] < 3:
+        raise ValueError("Need at least 3 tenors for PCA.")
+    if len(levels) < 120:
+        raise ValueError("Not enough rows (<120) to run PCA on returns.")
+
+    returns = levels.diff().dropna()
+
+    X = returns.values
+    mu = X.mean(axis=0)
+    Xc = X - mu
+
+    # SVD PCA
+    U, S, Vt = np.linalg.svd(Xc, full_matrices=False)
+    EV = Vt  # PCs x tenors
+
+    n_components = int(max(1, min(n_components, EV.shape[0])))
+    # explained variance ratio
+    # eigenvalues proportional to S^2/(n-1)
+    eigvals = (S**2) / (len(returns) - 1)
+    evr = eigvals / eigvals.sum()
+    explained = float(evr[:n_components].sum())
+
+    model = {
+        "levels": levels.loc[returns.index].copy(),  # align
+        "returns": returns.copy(),
+        "mean": mu,
+        "eigenvectors": EV,
+        "explained_variance": explained,
+        "maturities": np.array(returns.columns, dtype=float),
+    }
+    return model
+
+
+def reconstruct_returns(model: dict, k: int) -> pd.DataFrame:
+    """Reconstruct returns using first k PCs."""
+    ret = model["returns"]
+    mu = model["mean"]
+    EV = model["eigenvectors"]
+
+    k = int(max(1, min(k, EV.shape[0])))
+    EVk = EV[:k, :]
+
+    Xc = ret.values - mu
+    scores = Xc @ EVk.T
+    Xhat = scores @ EVk + mu
+    return pd.DataFrame(Xhat, index=ret.index, columns=ret.columns)
+
+
+def reconstruct_levels_from_returns(model: dict, k: int) -> pd.DataFrame:
+    """Integrate reconstructed returns to get reconstructed levels, anchored at first date."""
+    levels = model["levels"]
+    ret_hat = reconstruct_returns(model, k=k)
+
+    first_date = ret_hat.index[0]
+    lvl0 = levels.loc[first_date]
+
+    lvl_hat = ret_hat.cumsum().add(lvl0, axis=1)
+    lvl_hat = lvl_hat.reindex(levels.index)
+    return lvl_hat
+
+
+def reconstruct_one_date_table(model: dict, k: int, date, roll_z: int = 60) -> pd.DataFrame:
+    """Per-tenor one-date table: Actual / Reconstructed / Residual / Residual_z."""
+    levels = model["levels"]
+    lvl_hat = reconstruct_levels_from_returns(model, k=k)
+
+    date = pd.to_datetime(date)
+    if date not in levels.index:
+        # nearest previous
+        pos = levels.index.get_indexer([date], method="pad")[0]
+        date = levels.index[pos]
+
+    resid_hist = (levels - lvl_hat)
+    mu = resid_hist.rolling(roll_z).mean()
+    sd = resid_hist.rolling(roll_z).std()
+    z = (resid_hist - mu) / (sd + 1e-12)
+
+    table = pd.DataFrame(index=levels.columns)
+    table["Actual"] = levels.loc[date].values
+    table["Reconstructed"] = lvl_hat.loc[date].values
+    table["Residual"] = (levels.loc[date] - lvl_hat.loc[date]).values
+    table["Residual_z"] = z.loc[date].values
+    return table
+
+
+# =========================================================
+# Backtest: consumes PCA model (no PCA refit)
+# =========================================================
+
+def backtest_all_tenors_swap_pca(
+    model: dict,
+    k: int = 3,
+    roll: int = 60,
+    ewma_span: int = 20,
+    delta_size: float = 10000.0,
+    z_entry: float = 1.5,
+    z_exit: float = 0.5,
+    hedge_cost_per_bp: float = 0.20,
+):
+    """
+    Multi-tenor RV backtest using an EXISTING PCA model (no re-fit).
+
+    Signal:
+      resid = ret - ret_hat
+      z_raw  = zscore(resid, roll)
+      z_ewma = EWMA(z_raw, span)
+
+    Trading:
+      ENTRY on z_ewma:
+        z_ewma <= -z_entry -> LONG  (+delta)
+        z_ewma >= +z_entry -> SHORT (-delta)
+      EXIT on z_raw:
+        |z_raw| <= z_exit -> FLAT
+
+    PnL:
+      pnl_gross = pos(t-1) * (level(t)-level(t-1))
+      cost = hedge_cost_per_bp * |Δpos|
+      pnl_net = gross - cost
+    """
+    if "levels" not in model:
+        raise KeyError("model must contain 'levels' (needed for PnL).")
+
+    levels = model["levels"].copy()
+    ret = model["returns"].copy()
+
+    # reconstruct returns
+    ret_hat = reconstruct_returns(model, k=k)
+
+    perf_rows = []
+    pnl_curves_net = {}
+    z_last_raw = {}
+
+    for tenor in ret.columns:
+        resid = ret[tenor] - ret_hat[tenor]
+        z_raw = (resid - resid.rolling(roll).mean()) / (resid.rolling(roll).std() + 1e-12)
+        z_ewma = z_raw.ewm(span=int(ewma_span), adjust=False).mean()
+
+        df = pd.DataFrame({"y": levels[tenor], "z_raw": z_raw, "z_ewma": z_ewma}).dropna()
+        if len(df) < max(roll + 20, 80):
+            continue
+
+        pos = 0.0
+        last_entry = None
+        pos_list = []
+
+        for t in df.index:
+            prev = pos
+            zR = float(df.loc[t, "z_raw"])
+            zE = float(df.loc[t, "z_ewma"])
+
+            # EXIT on raw z
+            if abs(zR) <= z_exit:
+                pos = 0.0
+            else:
+                # ENTRY on ewma z
+                if zE <= -z_entry:
+                    pos = +delta_size
+                elif zE >= +z_entry:
+                    pos = -delta_size
+
+            if prev == 0.0 and pos != 0.0:
+                last_entry = t
+
+            pos_list.append(pos)
+
+        df["pos"] = pos_list
+        df["dy_bp"] = df["y"].diff()
+        df["pnl_gross"] = df["pos"].shift(1).fillna(0.0) * df["dy_bp"]
+
+        df["delta_change"] = df["pos"].diff().abs().fillna(df["pos"].abs())
+        df["hedge_cost"] = hedge_cost_per_bp * df["delta_change"]
+
+        df["pnl_net"] = df["pnl_gross"] - df["hedge_cost"]
+        df["pnl_cum_net"] = df["pnl_net"].cumsum()
+
+        pnl_net = df["pnl_net"]
+        sharpe_net = (
+            float(pnl_net.mean() / (pnl_net.std() + 1e-12) * np.sqrt(252))
+            if pnl_net.std() > 0
+            else 0.0
+        )
+        maxdd_net = float((df["pnl_cum_net"] - df["pnl_cum_net"].cummax()).min())
+        n_trades = int((df["pos"].diff().fillna(df["pos"]) != 0).sum())
+        hedge_cost_cum = float(df["hedge_cost"].sum())
+
+        last_pos = float(df["pos"].iloc[-1])
+        last_z = float(df["z_raw"].iloc[-1])
+        z_last_raw[tenor] = last_z
+
+        perf_rows.append(
+            {
+                "Tenor": tenor,
+                "FinalPnL_net": float(df["pnl_cum_net"].iloc[-1]),
+                "Sharpe_net": sharpe_net,
+                "MaxDD_net": maxdd_net,
+                "#Trades": n_trades,
+                "HedgeCostCum": hedge_cost_cum,
+                "LastZ_raw": last_z,
+                "Last entry date": last_entry.date() if last_entry is not None else None,
+                "Current position (Δ)": last_pos,
+            }
+        )
+        pnl_curves_net[tenor] = df["pnl_cum_net"]
+
+    if not perf_rows:
+        raise ValueError("No tenor could be backtested (too short / too many NaNs).")
+
+    perf_df = pd.DataFrame(perf_rows).set_index("Tenor")
+    pnl_curves_net = pd.DataFrame(pnl_curves_net).dropna(how="all")
+    z_last_raw = pd.Series(z_last_raw)
+
+    return perf_df, pnl_curves_net, z_last_raw
+
+
+# =========================================================
+# TAB 1 – Curve PCA (swap) + reconstruction + backtest
+# =========================================================
+
+def tab1_curve_pca_and_backtest(df_all: pd.DataFrame):
+    st.header("1️⃣ Curve PCA — Swap curve (PCA on daily returns) + Reconstruction + RV Backtest")
+
+    curves = build_swap_curve_dict(df_all)
+    # Filter to swap curves only for the selectbox
+    swap_keys = [k for k in curves.keys() if k.endswith("SWAP")]
+    if not swap_keys:
+        st.warning("Aucune courbe swap trouvée (EURSWAP_*, USDSWAP_*, GBPSWAP_*).")
+        return
+
+    curve_name = st.selectbox("Swap curve to analyse", swap_keys, index=0)
+    levels_full = curves[curve_name].copy()
+
+    # Date window
+    st.markdown("### Date window")
+    min_d = levels_full.index.min().date()
+    max_d = levels_full.index.max().date()
+    c1, c2 = st.columns(2)
+    with c1:
+        start_d = st.date_input("Start date", value=min_d, min_value=min_d, max_value=max_d)
+    with c2:
+        end_d = st.date_input("End date", value=max_d, min_value=min_d, max_value=max_d)
+
+    levels = levels_full.loc[(levels_full.index.date >= start_d) & (levels_full.index.date <= end_d)].copy()
+    levels = levels.dropna(how="all").dropna(axis=1, how="all")
+
+    st.info(f"Fenêtre utilisée: {start_d} → {end_d}  |  {len(levels)} points  |  {levels.shape[1]} tenors")
+
+    if len(levels) < 120 or levels.shape[1] < 3:
+        st.error("Pas assez de données (>=120 points et >=3 tenors requis).")
+        return
+
+    # PCA params
+    st.markdown("### PCA settings")
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        n_comp = st.slider("PCA components (fit)", 1, min(8, levels.shape[1]), 3)
+    with c2:
+        k_plot = st.slider("PCA factors used for reconstruction (k)", 1, min(8, levels.shape[1]), 3)
+    with c3:
+        roll = st.slider("Z-score window (rolling)", 20, 250, 60)
+
+    # Run PCA model (once)
+    model = run_curve_pca_on_returns(levels, n_components=int(n_comp))
+
+    st.markdown(
+        f"**Explained variance (first {n_comp} PCs):** {model['explained_variance']:.1%} "
+        f"(PCA estimated on daily returns)"
+    )
+
+    # -----------------------------------------------------
+    # 1) LOADINGS PLOT
+    # -----------------------------------------------------
+    st.subheader("PCA Loadings (PC1 / PC2 / PC3)")
+    maturities = model["maturities"]
+    EV = model["eigenvectors"]
+
+    figL, axL = plt.subplots(figsize=(10, 4))
+    n_show = min(3, EV.shape[0])
+    for i in range(n_show):
+        axL.plot(maturities, EV[i], marker="o", label=f"PC{i+1}")
+    axL.grid(True)
+    axL.legend()
+    axL.set_xlabel("Maturity (years)")
+    axL.set_title(f"{curve_name} — PCA loadings on returns")
+    st.pyplot(figL)
+
+    # -----------------------------------------------------
+    # 2) ONE-DATE PCA RECONSTRUCTION (LEVELS) - BEFORE BACKTEST
+    # -----------------------------------------------------
+    st.subheader("PCA Reconstruction — One Date (Levels) — BEFORE backtest")
+
+    dates_available = model["levels"].index
+    selected_date = st.selectbox("Date to analyse", options=list(dates_available[::-1]), index=0)
+
+    table = reconstruct_one_date_table(model=model, k=int(k_plot), date=selected_date, roll_z=int(roll))
+    st.dataframe(table.style.background_gradient(cmap="coolwarm", subset=["Residual_z"]), use_container_width=True)
+
+    # Plot actual vs recon levels
+    figR, axR = plt.subplots(figsize=(10, 4))
+    axR.plot(table.index.astype(float), table["Actual"].values, marker="o", label="Actual")
+    axR.plot(table.index.astype(float), table["Reconstructed"].values, marker="x", label="Reconstructed")
+    axR.grid(True)
+    axR.legend()
+    axR.set_xlabel("Maturity (years)")
+    axR.set_title(f"{curve_name} — Levels — {pd.to_datetime(selected_date).date()} (k={k_plot})")
+    st.pyplot(figR)
+
+    # Residual z bar
+    figB, axB = plt.subplots(figsize=(10, 3))
+    axB.bar([str(x) for x in table.index], table["Residual_z"].values)
+    axB.axhline(0, linestyle="--", linewidth=1)
+    axB.grid(True, axis="y")
+    axB.set_title(f"Residual Z (rolling={roll})")
+    plt.xticks(rotation=45)
+    st.pyplot(figB)
+
+    # -----------------------------------------------------
+    # 3) RV BACKTEST — ALL TENORS
+    # -----------------------------------------------------
+    st.subheader("RV Backtest — All Tenors (ENTRY on EWMA z, EXIT on raw z)")
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        ewma_span = st.slider("EWMA span", 5, 80, 20)
+    with c2:
+        z_entry = st.number_input("Entry |z| (EWMA)", value=1.5, step=0.1)
+    with c3:
+        z_exit = st.number_input("Exit |z| (raw)", value=0.5, step=0.1)
+    with c4:
+        hedge_cost = st.number_input("Hedge cost per bp-delta", value=0.20, step=0.01)
+
+    delta_size = st.number_input("Position size (delta)", value=10000.0, step=1000.0)
+
+    if st.button("▶ Run multi-tenor backtest"):
+        perf_df, pnl_curves_net, z_last_raw = backtest_all_tenors_swap_pca(
+            model=model,
+            k=int(k_plot),
+            roll=int(roll),
+            ewma_span=int(ewma_span),
+            delta_size=float(delta_size),
+            z_entry=float(z_entry),
+            z_exit=float(z_exit),
+            hedge_cost_per_bp=float(hedge_cost),
+        )
+
+        st.markdown("### Performance table")
+        st.dataframe(perf_df.round(4), use_container_width=True)
+
+        st.markdown("### Cumulative PnL (net) — equal weight + tenors")
+        port = pnl_curves_net.mean(axis=1)
+
+        figP, axP = plt.subplots(figsize=(14, 5))
+        axP.plot(port.index, port.values, label="Equal-weight portfolio", linewidth=2.5)
+        for c in pnl_curves_net.columns:
+            axP.plot(pnl_curves_net.index, pnl_curves_net[c].values, alpha=0.25)
+        axP.grid(True)
+        axP.legend()
+        axP.set_title("Net cumulative PnL (all tenors)")
+        st.pyplot(figP)
+
+        # Optional: z-score time series for a chosen tenor
+        st.markdown("### Z-score (raw) time series — selected tenor")
+        tenor_sel = st.selectbox("Tenor for z-score chart", options=list(pnl_curves_net.columns), index=0)
+
+        # recompute z for display (cheap)
+        ret_hat = reconstruct_returns(model, k=int(k_plot))
+        resid = model["returns"][tenor_sel] - ret_hat[tenor_sel]
+        z_raw = (resid - resid.rolling(int(roll)).mean()) / (resid.rolling(int(roll)).std() + 1e-12)
+        z_ew = z_raw.ewm(span=int(ewma_span), adjust=False).mean()
+
+        figZ, axZ = plt.subplots(figsize=(14, 3))
+        axZ.plot(z_raw.index, z_raw.values, label="z_raw")
+        axZ.plot(z_ew.index, z_ew.values, label="z_ewma")
+        axZ.axhline(+float(z_entry), linestyle="--", linewidth=1)
+        axZ.axhline(-float(z_entry), linestyle="--", linewidth=1)
+        axZ.axhline(+float(z_exit), linestyle=":", linewidth=1)
+        axZ.axhline(-float(z_exit), linestyle=":", linewidth=1)
+        axZ.grid(True)
+        axZ.legend()
+        axZ.set_title(f"Signal diagnostics — {tenor_sel}")
+        st.pyplot(figZ)
