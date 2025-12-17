@@ -1,0 +1,190 @@
+def backtest_all_tenors_pca_with_tradelog_by_tenor(
+    model,
+    z_window: int = 60,
+    delta_size: float = 10000.0,
+    z_entry: float = 1.5,
+    hedge_cost_per_bp: float = 0.20,
+):
+    """
+    Backtest RV multi-tenors basé sur PCA residuals.
+
+    Signal:
+      z_raw = zscore( residual_bp , rolling=z_window )
+
+    Trading logic (CROSSING ONLY, z_raw only):
+      - ENTER SHORT when z crosses UP above +z_entry
+      - EXIT SHORT  when z crosses DOWN back below +z_entry
+      - ENTER LONG  when z crosses DOWN below -z_entry
+      - EXIT LONG   when z crosses UP back above -z_entry
+
+    PnL:
+      Level Change(t) = Level_t - Level_{t-1}
+      pnl_gross(t)    = Level Change(t) * Exposure_t
+      hedge_cost(t)   = hedge_cost_per_bp * |Trade(Δ)|
+
+    Returns:
+      perf_df    : per-tenor metrics
+      pnl_df     : per-tenor daily net pnl
+      trade_logs : dict {tenor: trade_log_df}
+    """
+
+    residuals = model["residuals"]
+    levels = model["levels"]
+
+    pnl_curves = {}
+    perf_rows = []
+    trade_logs = {}
+
+    trigger = float(z_entry)
+
+    for tenor in residuals.columns:
+        # -------------------------
+        # Align data
+        # -------------------------
+        res = residuals[tenor].dropna()
+        lvl = levels[tenor].reindex(res.index).dropna()
+
+        idx = res.index.intersection(lvl.index)
+        res = res.loc[idx]
+        lvl = lvl.loc[idx]
+
+        if len(res) < max(80, z_window + 20):
+            continue
+
+        # -------------------------
+        # Z-score (RAW)
+        # -------------------------
+        z_raw = (res - res.rolling(z_window).mean()) / (
+            res.rolling(z_window).std() + 1e-12
+        )
+        z_raw = z_raw.dropna()
+
+        idx = idx.intersection(z_raw.index)
+        res = res.loc[idx]
+        lvl = lvl.loc[idx]
+        z_raw = z_raw.loc[idx]
+
+        if len(idx) < 50:
+            continue
+
+        # -------------------------
+        # Position / Trade series
+        # -------------------------
+        pos_list, trade_list, dir_list = [], [], []
+        pos = 0.0
+        prev_z = np.nan
+
+        for date in idx:
+            prev_pos = pos
+            z = float(z_raw.loc[date])
+
+            new_pos = pos
+
+            if np.isfinite(z) and np.isfinite(prev_z):
+
+                # ENTRY
+                if (prev_z <= +trigger) and (z > +trigger):
+                    new_pos = -float(delta_size)
+
+                elif (prev_z >= -trigger) and (z < -trigger):
+                    new_pos = +float(delta_size)
+
+                # EXIT
+                elif (pos < 0) and (prev_z >= +trigger) and (z < +trigger):
+                    new_pos = 0.0
+
+                elif (pos > 0) and (prev_z <= -trigger) and (z > -trigger):
+                    new_pos = 0.0
+
+            trade = new_pos - prev_pos
+            pos = new_pos
+
+            if pos > 0:
+                d = "BUY"
+            elif pos < 0:
+                d = "SELL"
+            else:
+                d = "FLAT"
+
+            pos_list.append(pos)
+            trade_list.append(trade)
+            dir_list.append(d)
+
+            prev_z = z
+
+        pos_series = pd.Series(pos_list, index=idx, name="Exposure Δ (cum)")
+        trade_series = pd.Series(trade_list, index=idx, name="Trade (Δ)")
+        dir_series = pd.Series(dir_list, index=idx, name="Direction")
+
+        # -------------------------
+        # Build backtest table
+        # -------------------------
+        bt = pd.DataFrame(index=idx)
+        bt["Date"] = bt.index
+        bt["Tenor"] = tenor
+        bt["Z"] = z_raw.loc[idx]
+        bt["Direction"] = dir_series
+        bt["Trade (Δ)"] = trade_series
+        bt["Exposure Δ (cum)"] = pos_series
+
+        bt["Level t"] = lvl.loc[idx]
+        bt["Level t-1"] = bt["Level t"].shift(1)
+
+        # 👉 NEW COLUMN
+        bt["Level Change"] = bt["Level t"] - bt["Level t-1"]
+
+        bt["PnL gross"] = bt["Level Change"] * bt["Exposure Δ (cum)"]
+        bt["PnL gross"] = bt["PnL gross"].fillna(0.0)
+        bt["PnL gross cum"] = bt["PnL gross"].cumsum()
+
+        bt["Hedge cost"] = hedge_cost_per_bp * bt["Trade (Δ)"].abs()
+        bt["Hedge cost"] = bt["Hedge cost"].fillna(0.0)
+
+        bt["PnL net"] = bt["PnL gross"] - bt["Hedge cost"]
+        bt["PnL net cum"] = bt["PnL net"].cumsum()
+
+        # -------------------------
+        # Store outputs
+        # -------------------------
+        pnl_curves[tenor] = bt["PnL net"]
+
+        s = bt["PnL net"]
+        sharpe = (s.mean() / (s.std() + 1e-12) * np.sqrt(252)) if s.std() > 0 else 0.0
+        maxdd = (bt["PnL net cum"] - bt["PnL net cum"].cummax()).min()
+        n_trades = int((bt["Trade (Δ)"] != 0).sum())
+
+        perf_rows.append({
+            "Tenor": tenor,
+            "FinalPnL_net": float(bt["PnL net cum"].iloc[-1]),
+            "Sharpe_net": float(sharpe),
+            "MaxDD_net": float(maxdd),
+            "#Trades": n_trades,
+            "LastPosΔ": float(bt["Exposure Δ (cum)"].iloc[-1]),
+            "LastZ_raw": float(z_raw.iloc[-1]),
+        })
+
+        bt_out = bt[[
+            "Date", "Tenor", "Z",
+            "Direction", "Trade (Δ)",
+            "Level t-1", "Level t",
+            "Level Change",
+            "Exposure Δ (cum)",
+            "PnL gross", "PnL gross cum",
+            "Hedge cost",
+            "PnL net", "PnL net cum"
+        ]].reset_index(drop=True)
+
+        trade_logs[tenor] = bt_out
+
+    if not perf_rows:
+        raise ValueError("No tenor could be backtested (insufficient data).")
+
+    perf_df = (
+        pd.DataFrame(perf_rows)
+        .set_index("Tenor")
+        .sort_values("Sharpe_net", ascending=False)
+    )
+
+    pnl_df = pd.DataFrame(pnl_curves).fillna(0.0)
+
+    return perf_df, pnl_df, trade_logs
