@@ -1,0 +1,92 @@
+import numpy as np
+import matplotlib.pyplot as plt
+
+def plot_multichart_zscore_by_maturity(
+    z_df,
+    maturities=None,
+    n_cols=2,
+    threshold=1.5,
+    title="Local Curve Dislocations (Z-score) by Maturity",
+    highlight_alpha=0.12,
+):
+    """
+    z_df: DataFrame index = dates, columns = maturities (ex: "3M","1Y","2Y"...), values = z-scores
+    maturities: list[str] optional, sinon on prend z_df.columns
+    """
+    if maturities is None:
+        maturities = list(z_df.columns)
+
+    mats = [m for m in maturities if m in z_df.columns]
+    if len(mats) == 0:
+        raise ValueError("Aucune maturité valide trouvée dans z_df.columns")
+
+    n = len(mats)
+    n_rows = int(np.ceil(n / n_cols))
+
+    # Compact "desk-trader" size
+    fig, axes = plt.subplots(
+        n_rows, n_cols,
+        figsize=(9, 1.6 * n_rows),
+        dpi=130,
+        sharex=True
+    )
+
+    # axes peut être 1D si n_rows==1
+    axes = np.array(axes).reshape(n_rows, n_cols)
+
+    for i, mat in enumerate(mats):
+        r = i // n_cols
+        c = i % n_cols
+        ax = axes[r, c]
+
+        s = z_df[mat].dropna()
+        if s.empty:
+            ax.set_axis_off()
+            continue
+
+        # ---- Plot zscore
+        ax.plot(s.index, s.values, linewidth=1.2)
+
+        # ---- Thresholds
+        ax.axhline(0, color="grey", linewidth=0.7)
+        ax.axhline(+threshold, linestyle="--", linewidth=0.8)
+        ax.axhline(-threshold, linestyle="--", linewidth=0.8)
+
+        # ---- Highlight background where |z| >= threshold
+        mask = (s.abs() >= threshold).astype(int)
+
+        # fill_between en "step" avec un band vertical : on remplit de ymin à ymax
+        ymin, ymax = ax.get_ylim()  # attention: après le plot
+        ax.fill_between(
+            s.index,
+            ymin, ymax,
+            where=mask.values.astype(bool),
+            step="pre",
+            alpha=highlight_alpha
+        )
+
+        ax.set_title(str(mat), fontsize=9)
+        ax.grid(True, alpha=0.25)
+        ax.tick_params(labelsize=8)
+
+        # plus propre
+        ax.spines["top"].set_visible(False)
+        ax.spines["right"].set_visible(False)
+
+    # Hide unused axes
+    for j in range(n, n_rows * n_cols):
+        r = j // n_cols
+        c = j % n_cols
+        axes[r, c].set_axis_off()
+
+    fig.suptitle(title, fontsize=12)
+    fig.tight_layout(rect=[0, 0, 1, 0.96])
+    return fig
+
+# z_df: DataFrame des z-scores par maturité (colonnes = maturités)
+fig = plot_multichart_zscore_by_maturity(
+    z_df=z_df,
+    threshold=1.5,
+    title="Local Curve Dislocations vs PCA Fair Value (Z-score)"
+)
+st.pyplot(fig)
