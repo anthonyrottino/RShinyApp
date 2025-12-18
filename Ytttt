@@ -1,0 +1,62 @@
+maturities = table.index.astype(str).tolist()
+
+# Split simple : short/belly vs long end
+short_end = [m for m in maturities if m in ["3M", "6M", "1Y", "2Y", "3Y", "5Y"]]
+long_end  = [m for m in maturities if m not in short_end]
+
+st.subheader("📊 PCA Residual Z-Score — Curve Dislocations (by Maturity)")
+
+zmap = table["Residual_z"].to_dict()
+
+n_left = len(short_end)
+n_right = len(long_end)
+n_rows = max(n_left, n_right)
+
+fig, axes = plt.subplots(
+    nrows=n_rows,
+    ncols=2,
+    figsize=(12, 1.3 * n_rows),
+    sharey=True
+)
+
+if n_rows == 1:
+    axes = np.array([axes])
+
+def plot_one(ax, mat, z):
+    color = (
+        "red" if z >= 1.5 else
+        "green" if z <= -1.5 else
+        "grey"
+    )
+    ax.bar([0], [z], color=color, width=0.4)
+    ax.axhline(0, color="black", linewidth=0.8)
+    ax.axhline(1.5, linestyle="--", color="red", linewidth=1)
+    ax.axhline(-1.5, linestyle="--", color="green", linewidth=1)
+    ax.set_ylim(-3.5, 3.5)
+    ax.set_title(mat, fontsize=9)
+    ax.grid(True, axis="y", alpha=0.3)
+    ax.set_xticks([])
+
+# Left column — short end
+for i in range(n_rows):
+    ax = axes[i, 0]
+    if i < n_left:
+        mat = short_end[i]
+        plot_one(ax, mat, zmap[mat])
+    else:
+        ax.axis("off")
+
+# Right column — long end
+for i in range(n_rows):
+    ax = axes[i, 1]
+    if i < n_right:
+        mat = long_end[i]
+        plot_one(ax, mat, zmap[mat])
+    else:
+        ax.axis("off")
+
+axes[0, 0].set_ylabel("Z-score", fontsize=9)
+
+fig.suptitle("Local Curve Dislocations vs PCA Fair Value", y=1.02)
+plt.tight_layout()
+st.pyplot(fig)
