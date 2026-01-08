@@ -1,0 +1,451 @@
+with tab2:
+    st.subheader("TAB 2 — Structural Risk Map (Global PCA + Clusters + Local PCA) — with visuals")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    eps = 1e-12
+
+    # =========================================================
+    # UI
+    # =========================================================
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        max_k_bucket = st.slider("Max clusters per bucket", 2, 10, 6, 1, key="t2_maxk")
+    with c2:
+        min_cluster_obs = st.slider("Min obs for cluster PCA", 20, 260, 30, 5, key="t2_minobs")
+    with c3:
+        top_loadings_n = st.slider("Top loadings shown", 3, 20, 8, 1, key="t2_topload")
+    with c4:
+        show_heatmap = st.checkbox("Show corr heatmap", value=False, key="t2_heat")
+
+    # =========================================================
+    # A) HELPERS
+    # =========================================================
+    def bucket_of(name: str) -> str:
+        u = name.upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    def auto_kmeans_no_singleton(corr_block: pd.DataFrame, max_k: int):
+        n = corr_block.shape[0]
+        if n <= 2:
+            return np.zeros(n, dtype=int), 1
+
+        X = corr_block.values
+        best_score = -np.inf
+        best_labels = np.zeros(n, dtype=int)
+        best_k = 1
+
+        for k in range(1, min(max_k, n // 2) + 1):
+            km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = km.fit_predict(X)
+
+            if k > 1:
+                sizes = pd.Series(labels).value_counts()
+                if (sizes < 2).any():
+                    continue
+
+            if k > 1:
+                try:
+                    score = silhouette_score(X, labels)
+                except Exception:
+                    score = -km.inertia_
+            else:
+                score = -km.inertia_
+
+            if score > best_score:
+                best_score, best_labels, best_k = score, labels, k
+
+        return best_labels, best_k
+
+    # =========================================================
+    # B) DATA PREP — dPnL
+    # =========================================================
+    factors = pnl_by_factor.columns.tolist()
+    buckets = pd.Series({f: bucket_of(f) for f in factors}, name="Bucket")
+
+    dPnL = (
+        pnl_by_factor
+        .diff()
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(how="any")
+    )
+
+    # =========================================================
+    # C) GLOBAL PCA (STATIC) — PC1 & PC2
+    # =========================================================
+    scaler = StandardScaler()
+    X = scaler.fit_transform(dPnL.values)
+
+    pca_g = PCA(n_components=2, random_state=42)
+    PC = pca_g.fit_transform(X)
+
+    pc1_score = pd.Series(PC[:, 0], index=dPnL.index, name="PC1_score")
+    pc2_score = pd.Series(PC[:, 1], index=dPnL.index, name="PC2_score")
+
+    z1 = (pc1_score - pc1_score.mean()) / (pc1_score.std(ddof=1) + eps)
+    z2 = (pc2_score - pc2_score.mean()) / (pc2_score.std(ddof=1) + eps)
+
+    stress_pc1 = (z1.abs() / 3.0).clip(0.0, 1.0).rename("Stress_PC1")
+    stress_pc2 = (z2.abs() / 3.0).clip(0.0, 1.0).rename("Stress_PC2")
+    stress_global = pd.concat([stress_pc1, stress_pc2], axis=1).max(axis=1).rename("PCA_stress_global")
+
+    loadings_pc1 = pd.Series(pca_g.components_[0], index=factors, name="loading_PC1")
+    loadings_pc2 = pd.Series(pca_g.components_[1], index=factors, name="loading_PC2")
+
+    # =========================================================
+    # D) AUTO-KMEANS BY BUCKET
+    # =========================================================
+    corr_mat = dPnL.corr().fillna(0.0)
+
+    cluster_map = pd.Series(index=factors, dtype=int)
+    cid = 1
+    chosen_k = {}
+
+    for bkt in ["Rates", "XCCY", "FX"]:
+        cols = buckets[buckets == bkt].index.tolist()
+        if not cols:
+            continue
+
+        corr_block = corr_mat.loc[cols, cols]
+        labels, k = auto_kmeans_no_singleton(corr_block, max_k=int(max_k_bucket))
+        chosen_k[bkt] = int(k)
+
+        for f, lab in zip(cols, labels):
+            cluster_map[f] = cid + int(lab)
+
+        cid += int(k)
+
+    cluster_map = cluster_map.astype(int)
+
+    # =========================================================
+    # E) PCA (PC1 & PC2) INSIDE EACH CLUSTER — LOCAL STRESS + LOADINGS
+    # =========================================================
+    cluster_ids = sorted(cluster_map.unique())
+
+    cl_stress_pc1 = pd.DataFrame(0.0, index=dPnL.index, columns=cluster_ids)
+    cl_stress_pc2 = pd.DataFrame(0.0, index=dPnL.index, columns=cluster_ids)
+
+    cl_load_pc1 = {}
+    cl_load_pc2 = {}
+
+    for cid_ in cluster_ids:
+        cols = cluster_map[cluster_map == cid_].index.tolist()
+        if len(cols) < 2:
+            continue
+
+        Xc = dPnL[cols].dropna(how="any")
+        if len(Xc) < int(min_cluster_obs):
+            continue
+
+        Xc_std = StandardScaler().fit_transform(Xc.values)
+        pca_c = PCA(n_components=2, random_state=42)
+        PCc = pca_c.fit_transform(Xc_std)
+
+        s1 = (pd.Series(PCc[:, 0], index=Xc.index) - PCc[:, 0].mean()) / (PCc[:, 0].std(ddof=1) + eps)
+        s2 = (pd.Series(PCc[:, 1], index=Xc.index) - PCc[:, 1].mean()) / (PCc[:, 1].std(ddof=1) + eps)
+
+        cl_stress_pc1.loc[Xc.index, cid_] = (s1.abs() / 3.0).clip(0.0, 1.0)
+        cl_stress_pc2.loc[Xc.index, cid_] = (s2.abs() / 3.0).clip(0.0, 1.0)
+
+        cl_load_pc1[cid_] = pd.Series(pca_c.components_[0], index=cols)
+        cl_load_pc2[cid_] = pd.Series(pca_c.components_[1], index=cols)
+
+    cl_stress_max = pd.concat([cl_stress_pc1.max(axis=1), cl_stress_pc2.max(axis=1)], axis=1).max(axis=1)
+    cl_stress_max.name = "Cluster_stress_max"
+
+    # =========================================================
+    # F) STORE OUTPUTS (Tab 3/4)
+    # =========================================================
+    st.session_state["TAB2_PCA_STRESS_PC1"] = stress_pc1
+    st.session_state["TAB2_PCA_STRESS_PC2"] = stress_pc2
+    st.session_state["TAB2_PCA_STRESS_GLOBAL"] = stress_global
+
+    st.session_state["TAB2_PC1_SCORE"] = pc1_score
+    st.session_state["TAB2_PC2_SCORE"] = pc2_score
+
+    st.session_state["TAB2_LOADINGS_PC1"] = loadings_pc1
+    st.session_state["TAB2_LOADINGS_PC2"] = loadings_pc2
+
+    st.session_state["TAB2_CLUSTER_MAP"] = cluster_map
+    st.session_state["TAB2_CLUSTER_STRESS_PC1"] = cl_stress_pc1
+    st.session_state["TAB2_CLUSTER_STRESS_PC2"] = cl_stress_pc2
+    st.session_state["TAB2_CLUSTER_STRESS_MAX"] = cl_stress_max
+
+    st.session_state["TAB2_CLUSTER_LOADINGS_PC1"] = cl_load_pc1
+    st.session_state["TAB2_CLUSTER_LOADINGS_PC2"] = cl_load_pc2
+
+    # =========================================================
+    # G) VISUALS
+    # =========================================================
+
+    # --- Global PCA panel: stress + scores
+    st.markdown("### Global PCA (PC1 / PC2) — Stress & Scores")
+
+    fig, ax = plt.subplots(figsize=(12, 4), dpi=120)
+    ax.plot(stress_pc1.index, stress_pc1.values, label="Stress PC1")
+    ax.plot(stress_pc2.index, stress_pc2.values, label="Stress PC2", ls="--")
+    ax.plot(stress_global.index, stress_global.values, label="Stress Global (max)", lw=1.6, alpha=0.75)
+    ax.set_ylim(0, 1.05)
+    ax.set_title("Global PCA stress on dPnL")
+    ax.legend(loc="upper left")
+    auto_xticks(ax, stress_global.index)
+    st.pyplot(fig)
+
+    fig, ax = plt.subplots(figsize=(12, 3.5), dpi=120)
+    ax.plot(pc1_score.index, pc1_score.values, label="PC1 score")
+    ax.plot(pc2_score.index, pc2_score.values, label="PC2 score", ls="--")
+    ax.set_title("Global PCA scores")
+    ax.legend(loc="upper left")
+    auto_xticks(ax, pc1_score.index)
+    st.pyplot(fig)
+
+    # --- Global loadings (PC1 / PC2)
+    st.markdown("### Global PCA loadings — what drives PC1 / PC2")
+
+    def _plot_top_loadings(loadings: pd.Series, title: str, n: int):
+        s = loadings.copy().sort_values(key=lambda x: x.abs(), ascending=False).head(int(n))
+        fig, ax = plt.subplots(figsize=(10, 3.6), dpi=120)
+        ax.bar(s.index, s.values)
+        ax.set_title(title)
+        ax.tick_params(axis="x", rotation=45, labelsize=8)
+        st.pyplot(fig)
+
+    _plot_top_loadings(loadings_pc1, f"Top |loadings| — PC1 (global)", top_loadings_n)
+    _plot_top_loadings(loadings_pc2, f"Top |loadings| — PC2 (global)", top_loadings_n)
+
+    # --- Clusters view
+    st.markdown("### Buckets & Clusters")
+    cl_df = pd.DataFrame({"Bucket": buckets, "Cluster": cluster_map}).sort_values(["Bucket", "Cluster"])
+    st.dataframe(cl_df, use_container_width=True, height=320)
+    st.caption(f"Chosen k per bucket: {chosen_k}")
+
+    # --- Correlation heatmap sorted by bucket/cluster
+    if show_heatmap:
+        with st.expander("Corr(dPnL) heatmap sorted by Bucket/Cluster", expanded=False):
+            order = cl_df.index.tolist()
+            sorted_corr = corr_mat.loc[order, order]
+
+            fig, ax = plt.subplots(figsize=(7, 6), dpi=120)
+            im = ax.imshow(sorted_corr.values, aspect="auto")
+            ax.set_xticks(range(len(order)))
+            ax.set_yticks(range(len(order)))
+            ax.set_xticklabels(order, rotation=90, fontsize=6)
+            ax.set_yticklabels(order, fontsize=6)
+            ax.set_title("Correlation heatmap (sorted)")
+            fig.colorbar(im, ax=ax, fraction=0.046, pad=0.04)
+            st.pyplot(fig)
+
+    # --- Cluster stress dashboard
+    st.markdown("### Cluster stress (PC1 / PC2)")
+
+    with st.expander("Cluster stress time series", expanded=False):
+        fig, ax = plt.subplots(figsize=(12, 4), dpi=120)
+        for cid_ in cluster_ids:
+            s = pd.concat([cl_stress_pc1[cid_], cl_stress_pc2[cid_]], axis=1).max(axis=1)
+            ax.plot(s.index, s.values, lw=0.9, alpha=0.8, label=f"Cluster {cid_}")
+        ax.set_ylim(0, 1.05)
+        ax.set_title("Cluster stress (max of PC1/PC2) over time")
+        ax.legend(loc="upper left", ncols=3, fontsize=8)
+        auto_xticks(ax, dPnL.index)
+        st.pyplot(fig)
+
+    with st.expander("Cluster stress summary table", expanded=False):
+        rows = []
+        for cid_ in cluster_ids:
+            smax = pd.concat([cl_stress_pc1[cid_], cl_stress_pc2[cid_]], axis=1).max(axis=1)
+            rows.append({
+                "Cluster": cid_,
+                "Bucket_dominant": cl_df[cl_df["Cluster"] == cid_]["Bucket"].mode().iloc[0] if (cl_df["Cluster"] == cid_).any() else "",
+                "Stress_mean": float(smax.mean()),
+                "Stress_p95": float(smax.quantile(0.95)),
+                "%days_stress>0.7": float((smax > 0.7).mean() * 100.0),
+                "Nb_factors": int((cluster_map == cid_).sum()),
+            })
+        out = pd.DataFrame(rows).set_index("Cluster").sort_values("%days_stress>0.7", ascending=False)
+        st.dataframe(out.style.format({
+            "Stress_mean": "{:.2f}",
+            "Stress_p95": "{:.2f}",
+            "%days_stress>0.7": "{:.1f}",
+        }), use_container_width=True, height=320)
+
+    # --- Cluster drivers (top loadings inside each cluster)
+    st.markdown("### Cluster drivers — top PCA loadings (per cluster)")
+
+    with st.expander("Drivers table (top loadings per cluster)", expanded=False):
+        rows = []
+        for cid_ in cluster_ids:
+            cols = cluster_map[cluster_map == cid_].index.tolist()
+            if cid_ not in cl_load_pc1 or cid_ not in cl_load_pc2:
+                continue
+
+            L1 = cl_load_pc1[cid_].reindex(cols).dropna()
+            L2 = cl_load_pc2[cid_].reindex(cols).dropna()
+
+            top1 = L1.abs().sort_values(ascending=False).head(int(top_loadings_n))
+            top2 = L2.abs().sort_values(ascending=False).head(int(top_loadings_n))
+
+            rows.append({
+                "Cluster": cid_,
+                "Bucket": cl_df[cl_df["Cluster"] == cid_]["Bucket"].mode().iloc[0] if (cl_df["Cluster"] == cid_).any() else "",
+                "Top_PC1": ", ".join([f"{k}({L1[k]:+.2f})" for k in top1.index]),
+                "Top_PC2": ", ".join([f"{k}({L2[k]:+.2f})" for k in top2.index]),
+            })
+
+        drivers = pd.DataFrame(rows).set_index("Cluster")
+        st.dataframe(drivers, use_container_width=True, height=360)
+
+
+# =========================================================
+# VISUAL 1 — STRESS CALENDAR (GLOBAL + TOP CLUSTERS)
+# =========================================================
+st.markdown("### Stress calendar (Global + top clusters)")
+
+cal1, cal2, cal3 = st.columns(3)
+with cal1:
+    thr_global = st.slider("Global stress threshold", 0.10, 0.95, 0.70, 0.05, key="t2_cal_thr_g")
+with cal2:
+    thr_cluster = st.slider("Cluster stress threshold", 0.10, 0.95, 0.70, 0.05, key="t2_cal_thr_c")
+with cal3:
+    topK_clusters = st.slider("Top K clusters per day", 1, 8, 3, 1, key="t2_cal_topk")
+
+# series used
+sG = stress_global.reindex(dPnL.index).fillna(0.0)  # global stress (0..1)
+sC = pd.concat([cl_stress_pc1, cl_stress_pc2], axis=1)  # wide table, but easier to compute max per cluster:
+cluster_stress_ts = pd.DataFrame(
+    {cid_: pd.concat([cl_stress_pc1[cid_], cl_stress_pc2[cid_]], axis=1).max(axis=1)
+     for cid_ in cluster_ids},
+    index=dPnL.index
+).fillna(0.0)
+
+# Build a per-day label: "G" if global stress, plus top stressed clusters above threshold
+rows = []
+for t in dPnL.index:
+    tags = []
+    if float(sG.loc[t]) >= float(thr_global):
+        tags.append("G")
+    # clusters
+    s_row = cluster_stress_ts.loc[t].sort_values(ascending=False)
+    s_row = s_row[s_row >= float(thr_cluster)]
+    top_ids = list(s_row.head(int(topK_clusters)).index)
+    if top_ids:
+        tags += [f"C{int(x)}" for x in top_ids]
+    rows.append(" ".join(tags))
+
+tag_series = pd.Series(rows, index=dPnL.index, name="StressTags")
+
+# Calendar table (month x day)
+cal = pd.DataFrame({
+    "date": tag_series.index,
+    "tags": tag_series.values,
+})
+cal["year"] = cal["date"].dt.year
+cal["month"] = cal["date"].dt.month
+cal["day"] = cal["date"].dt.day
+
+# show last N months
+months_back = st.slider("Months shown", 1, 24, 6, 1, key="t2_cal_months")
+last_date = cal["date"].max()
+first_date = (last_date - pd.DateOffset(months=int(months_back))).normalize()
+cal = cal[cal["date"] >= first_date]
+
+# pivot (month label, day columns)
+cal["month_label"] = cal["date"].dt.strftime("%Y-%m")
+pivot = cal.pivot_table(index="month_label", columns="day", values="tags", aggfunc="first").fillna("")
+
+with st.expander("Calendar view", expanded=True):
+    st.dataframe(pivot, use_container_width=True, height=320)
+
+# also show a compact daily table for the latest days
+with st.expander("Latest stress days (decoded)", expanded=False):
+    out = pd.DataFrame({
+        "GlobalStress": sG,
+        "TopClusterStress": cluster_stress_ts.max(axis=1),
+        "Tags": tag_series
+    }).tail(60)
+    st.dataframe(out, use_container_width=True, height=320)
+
+# =========================================================
+# VISUAL 2 — WHO LEADS (PER CLUSTER)
+# =========================================================
+st.markdown("### Who leads each cluster? (Leader factor vs cluster PC score)")
+
+w1, w2, w3 = st.columns([1, 1, 2])
+with w1:
+    cluster_pick = st.selectbox("Cluster", cluster_ids, index=0, key="t2_who_cluster")
+with w2:
+    pc_pick = st.selectbox("PC", ["PC1", "PC2"], index=0, key="t2_who_pc")
+with w3:
+    show_scatter = st.checkbox("Show scatter leader dPnL vs cluster PC", value=True, key="t2_who_scatter")
+
+cid_ = int(cluster_pick)
+cols = cluster_map[cluster_map == cid_].index.tolist()
+
+if (cid_ not in cl_load_pc1) or (cid_ not in cl_load_pc2) or (len(cols) < 2):
+    st.info("Cluster PCA loadings not available for this cluster (too small or not enough data).")
+else:
+    # pick leader by absolute loading on chosen PC
+    L = cl_load_pc1[cid_] if pc_pick == "PC1" else cl_load_pc2[cid_]
+    L = pd.Series(L).reindex(cols).dropna()
+    leader = L.abs().sort_values(ascending=False).index[0]
+    leader_loading = float(L.loc[leader])
+
+    # rebuild cluster PCA score series (static fit) for the chosen PC (on cluster data)
+    Xc = dPnL[cols].dropna(how="any")
+    if len(Xc) < int(min_cluster_obs):
+        st.info("Not enough observations to rebuild cluster PC score.")
+    else:
+        Xc_std = StandardScaler().fit_transform(Xc.values)
+        pca_c = PCA(n_components=2, random_state=42)
+        PCc = pca_c.fit_transform(Xc_std)
+
+        pc_idx = 0 if pc_pick == "PC1" else 1
+        pc_score = pd.Series(PCc[:, pc_idx], index=Xc.index, name=f"Cluster{cid_}_{pc_pick}_score")
+
+        # leader dPnL series aligned
+        leader_dpnl = dPnL[leader].reindex(pc_score.index).fillna(0.0)
+
+        corr_val = float(leader_dpnl.corr(pc_score))
+
+        st.write(f"**Cluster {cid_} leader on {pc_pick}:** `{leader}` (loading={leader_loading:+.3f})")
+        st.write(f"Correlation(leader dPnL, cluster {pc_pick} score) = **{corr_val:+.2f}**")
+
+        # overlay timeseries
+        fig, ax = plt.subplots(figsize=(12, 4), dpi=120)
+        ax.plot(pc_score.index, pc_score.values, label=f"Cluster {pc_pick} score")
+        ax.plot(leader_dpnl.index, leader_dpnl.values, label=f"Leader dPnL: {leader}", ls="--")
+        ax.set_title(f"Cluster {cid_} — Leader vs {pc_pick} score")
+        ax.legend(loc="upper left")
+        auto_xticks(ax, pc_score.index)
+        st.pyplot(fig)
+
+        # optional scatter
+        if show_scatter:
+            fig2, ax2 = plt.subplots(figsize=(6.5, 5), dpi=120)
+            ax2.scatter(leader_dpnl.values, pc_score.values, s=10, alpha=0.6)
+            ax2.set_title(f"Scatter: {leader} dPnL vs Cluster {pc_pick} score")
+            ax2.set_xlabel("Leader dPnL")
+            ax2.set_ylabel(f"Cluster {pc_pick} score")
+            st.pyplot(fig2)
+
+        # quick table: top drivers list
+        topN = int(top_loadings_n)
+        top_drivers = L.abs().sort_values(ascending=False).head(topN)
+        driver_tbl = pd.DataFrame({
+            "factor": top_drivers.index,
+            "loading": [float(L.loc[f]) for f in top_drivers.index],
+            "|loading|": [float(abs(L.loc[f])) for f in top_drivers.index],
+        }).set_index("factor")
+        with st.expander("Top drivers in cluster", expanded=False):
+            st.dataframe(driver_tbl.style.format({"loading": "{:+.3f}", "|loading|": "{:.3f}"}),
+                         use_container_width=True, height=260)
