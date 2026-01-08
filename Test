@@ -1,0 +1,192 @@
+with tab2:
+    st.subheader("TAB 2 — Structural Risk Map (Global PCA + Cluster PCA)")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+    from sklearn.metrics import silhouette_score
+
+    eps = 1e-12
+
+    # =========================================================
+    # A) HELPERS
+    # =========================================================
+    def bucket_of(name: str) -> str:
+        u = name.upper()
+        if "FX" in u or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+
+    def auto_kmeans_no_singleton(corr_block: pd.DataFrame, max_k: int = 6):
+        """
+        Auto-select k using silhouette / inertia.
+        Forbid singleton clusters.
+        """
+        n = corr_block.shape[0]
+        if n <= 2:
+            return np.zeros(n, dtype=int), 1
+
+        X = corr_block.values
+        best_score = -np.inf
+        best_labels = np.zeros(n, dtype=int)
+        best_k = 1
+
+        for k in range(1, min(max_k, n // 2) + 1):
+            km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = km.fit_predict(X)
+
+            if k > 1:
+                sizes = pd.Series(labels).value_counts()
+                if (sizes < 2).any():
+                    continue
+
+            if k > 1:
+                try:
+                    score = silhouette_score(X, labels)
+                except Exception:
+                    score = -km.inertia_
+            else:
+                score = -km.inertia_
+
+            if score > best_score:
+                best_score = score
+                best_labels = labels
+                best_k = k
+
+        return best_labels, best_k
+
+    # =========================================================
+    # B) DATA PREP — dPnL
+    # =========================================================
+    factors = pnl_by_factor.columns.tolist()
+    buckets = pd.Series({f: bucket_of(f) for f in factors}, name="Bucket")
+
+    dPnL = (
+        pnl_by_factor
+        .diff()
+        .replace([np.inf, -np.inf], np.nan)
+        .dropna(how="any")
+    )
+
+    # =========================================================
+    # C) GLOBAL PCA (STATIC) — PC1 & PC2
+    # =========================================================
+    scaler = StandardScaler()
+    X = scaler.fit_transform(dPnL.values)
+
+    pca_g = PCA(n_components=2, random_state=42)
+    PC = pca_g.fit_transform(X)
+
+    PC1, PC2 = PC[:, 0], PC[:, 1]
+
+    z1 = (PC1 - PC1.mean()) / (PC1.std(ddof=1) + eps)
+    z2 = (PC2 - PC2.mean()) / (PC2.std(ddof=1) + eps)
+
+    stress_pc1 = np.clip(np.abs(z1) / 3.0, 0.0, 1.0)
+    stress_pc2 = np.clip(np.abs(z2) / 3.0, 0.0, 1.0)
+
+    PCA_stress_global = pd.Series(
+        np.maximum(stress_pc1, stress_pc2),
+        index=dPnL.index,
+        name="PCA_stress_global"
+    )
+
+    loadings_pc1 = pd.Series(pca_g.components_[0], index=factors)
+    loadings_pc2 = pd.Series(pca_g.components_[1], index=factors)
+
+    # =========================================================
+    # D) AUTO-KMEANS BY BUCKET
+    # =========================================================
+    corr_mat = dPnL.corr().fillna(0.0)
+
+    cluster_map = pd.Series(index=factors, dtype=int)
+    cid = 1
+
+    for bkt in ["Rates", "XCCY", "FX"]:
+        cols = buckets[buckets == bkt].index.tolist()
+        if len(cols) == 0:
+            continue
+
+        corr_block = corr_mat.loc[cols, cols]
+        labels, k = auto_kmeans_no_singleton(corr_block)
+
+        for f, lab in zip(cols, labels):
+            cluster_map[f] = cid + lab
+
+        cid += k
+
+    cluster_map = cluster_map.astype(int)
+
+    # =========================================================
+    # E) PCA (PC1 & PC2) INSIDE EACH CLUSTER
+    # =========================================================
+    cluster_ids = sorted(cluster_map.unique())
+
+    cl_stress_pc1 = pd.DataFrame(0.0, index=dPnL.index, columns=cluster_ids)
+    cl_stress_pc2 = pd.DataFrame(0.0, index=dPnL.index, columns=cluster_ids)
+
+    cl_load_pc1 = {}
+    cl_load_pc2 = {}
+
+    for cid in cluster_ids:
+        cols = cluster_map[cluster_map == cid].index.tolist()
+        if len(cols) < 2:
+            continue
+
+        Xc = dPnL[cols].dropna(how="any")
+        if len(Xc) < 30:
+            continue
+
+        Xc_std = StandardScaler().fit_transform(Xc.values)
+
+        pca_c = PCA(n_components=2, random_state=42)
+        PCc = pca_c.fit_transform(Xc_std)
+
+        zc1 = (PCc[:, 0] - PCc[:, 0].mean()) / (PCc[:, 0].std(ddof=1) + eps)
+        zc2 = (PCc[:, 1] - PCc[:, 1].mean()) / (PCc[:, 1].std(ddof=1) + eps)
+
+        cl_stress_pc1.loc[Xc.index, cid] = np.clip(np.abs(zc1) / 3.0, 0.0, 1.0)
+        cl_stress_pc2.loc[Xc.index, cid] = np.clip(np.abs(zc2) / 3.0, 0.0, 1.0)
+
+        cl_load_pc1[cid] = pd.Series(pca_c.components_[0], index=cols)
+        cl_load_pc2[cid] = pd.Series(pca_c.components_[1], index=cols)
+
+    cl_stress_max = pd.concat(
+        [cl_stress_pc1.max(axis=1), cl_stress_pc2.max(axis=1)],
+        axis=1
+    ).max(axis=1)
+    cl_stress_max.name = "Cluster_stress_max"
+
+    # =========================================================
+    # F) STORE OUTPUTS (FOR TAB 3 / TAB 4)
+    # =========================================================
+    st.session_state["TAB2_PCA_STRESS_PC1"] = pd.Series(stress_pc1, index=dPnL.index)
+    st.session_state["TAB2_PCA_STRESS_PC2"] = pd.Series(stress_pc2, index=dPnL.index)
+    st.session_state["TAB2_PCA_STRESS_GLOBAL"] = PCA_stress_global
+
+    st.session_state["TAB2_LOADINGS_PC1"] = loadings_pc1
+    st.session_state["TAB2_LOADINGS_PC2"] = loadings_pc2
+
+    st.session_state["TAB2_CLUSTER_MAP"] = cluster_map
+    st.session_state["TAB2_CLUSTER_STRESS_PC1"] = cl_stress_pc1
+    st.session_state["TAB2_CLUSTER_STRESS_PC2"] = cl_stress_pc2
+    st.session_state["TAB2_CLUSTER_STRESS_MAX"] = cl_stress_max
+
+    st.session_state["TAB2_CLUSTER_LOADINGS_PC1"] = cl_load_pc1
+    st.session_state["TAB2_CLUSTER_LOADINGS_PC2"] = cl_load_pc2
+
+    # =========================================================
+    # G) QUICK VISUAL CHECK
+    # =========================================================
+    fig, ax = plt.subplots(figsize=(12,4), dpi=120)
+    ax.plot(PCA_stress_global.index, PCA_stress_global.values, label="Global PCA Stress")
+    ax.set_title("Global PCA Stress (PC1 / PC2)")
+    ax.legend()
+    st.pyplot(fig)
