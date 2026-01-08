@@ -1,0 +1,908 @@
+with tab3:
+    st.subheader("TAB 3 — Spot Hedge Engine (Backtest) — PCA stress → α(t), β-based DV01 translation, XCCY cross-hedge")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from dataclasses import dataclass
+
+    eps = 1e-12
+
+    # =========================================================
+    # Utilities
+    # =========================================================
+    def _dedup_index(x):
+        if isinstance(x, (pd.Series, pd.DataFrame)) and x.index.has_duplicates:
+            return x[~x.index.duplicated(keep="last")]
+        return x
+
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if ("FX" in u) or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if ("XCCY" in u) or ("BASIS" in u):
+            return "XCCY"
+        return "Rates"
+
+    def _unit_cost(bucket: str, cost_rate: float, cost_xccy: float, cost_fx: float) -> float:
+        if bucket == "FX":
+            return float(cost_fx)
+        if bucket == "XCCY":
+            return float(cost_xccy)
+        return float(cost_rate)
+
+    def _map_alpha(stress: pd.Series, tau1: float, tau2: float, tau3: float) -> pd.Series:
+        s = stress.astype(float).copy()
+        out = pd.Series(0.0, index=s.index)
+        out[(s >= tau1) & (s < tau2)] = 0.3
+        out[(s >= tau2) & (s < tau3)] = 0.6
+        out[s >= tau3] = 1.0
+        return out
+
+    def _safe_series(x, index, fill=0.0) -> pd.Series:
+        if x is None:
+            return pd.Series(fill, index=index, dtype=float)
+        s = pd.Series(x).reindex(index)
+        return s.ffill().fillna(fill).astype(float)
+
+    def _safe_df(x, index, columns, fill=0.0) -> pd.DataFrame:
+        df = pd.DataFrame(x) if not isinstance(x, pd.DataFrame) else x.copy()
+        df = df.reindex(index).reindex(columns=columns)
+        return df.ffill().fillna(fill)
+
+    def _beta_ols_noint(x: np.ndarray, y: np.ndarray) -> float:
+        # β = argmin ||y - β x||²  =>  β = (x'y)/(x'x)
+        denom = float(np.dot(x, x)) + eps
+        return float(np.dot(x, y) / denom)
+
+    # =========================================================
+    # UI: parameters
+    # =========================================================
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        topN = st.slider("Top N hedges/day", 1, 30, 6, 1, key="t3_topN")
+    with c2:
+        apply_day = st.selectbox("Execute hedge", ["Jour T", "Jour T+1"], index=1, key="t3_apply_day")
+    with c3:
+        beta_win = st.slider("β window (days, rolling OLS)", 30, 520, 250, 10, key="t3_beta_win")
+    with c4:
+        one_per_cluster = st.checkbox("Max 1 hedge / cluster / day", value=True, key="t3_one_per_cluster")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        tau1 = st.slider("τ1 → α=0.3", 0.0, 1.0, 0.50, 0.05, key="t3_tau1")
+    with d2:
+        tau2 = st.slider("τ2 → α=0.6", 0.0, 1.0, 0.70, 0.05, key="t3_tau2")
+    with d3:
+        tau3 = st.slider("τ3 → α=1.0", 0.0, 1.0, 0.85, 0.05, key="t3_tau3")
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        cost_rate = st.number_input("Cost — Rates (per DV01 own)", 0.0, 5.0, 0.20, 0.01, key="t3_cost_rate")
+    with e2:
+        cost_xccy = st.number_input("Cost — XCCY (per DV01 own)", 0.0, 5.0, 0.25, 0.01, key="t3_cost_xccy")
+    with e3:
+        cost_fx = st.number_input("Cost — FX (per FX01 own)", 0.0, 5.0, 0.00, 0.01, key="t3_cost_fx")
+
+    f1, f2, f3 = st.columns(3)
+    with f1:
+        gate_by_cluster_stress = st.checkbox("Gate by cluster stress", value=False, key="t3_gate_cluster")
+    with f2:
+        cluster_thr = st.slider("Cluster stress threshold", 0.0, 1.0, 0.70, 0.05, key="t3_cluster_thr")
+    with f3:
+        min_abs_corr = st.slider("|corr| threshold for XCCY cross-hedge", 0.0, 1.0, 0.40, 0.05, key="t3_min_corr")
+
+    # =========================================================
+    # Inputs / alignment (Tab1/Tab2 objects)
+    # =========================================================
+    pnl_by_factor = _dedup_index(pnl_by_factor)
+    net_daily = _dedup_index(net_daily)
+    risk_ts = _dedup_index(risk_ts)
+    mkt_change = _dedup_index(mkt_change)
+
+    idx = pnl_by_factor.index
+    factors = list(pnl_by_factor.columns)
+
+    # Global stress: max(stress PC1, stress PC2) from Tab2
+    s_pc1 = st.session_state.get("TAB2_PCA_STRESS_PC1", None)
+    s_pc2 = st.session_state.get("TAB2_PCA_STRESS_PC2", None)
+    stress_pc1 = _safe_series(s_pc1, idx, fill=0.0)
+    stress_pc2 = _safe_series(s_pc2, idx, fill=0.0)
+    stress_global = pd.concat([stress_pc1, stress_pc2], axis=1).max(axis=1).rename("stress_global")
+
+    # Cluster mapping + cluster stress (optional gate)
+    cl_map = st.session_state.get("TAB2_CLUSTER_MAP", None)
+    cl_stress = st.session_state.get("TAB2_CLUSTER_STRESS", None)
+
+    if cl_map is None or cl_stress is None:
+        cluster_map = pd.Series(index=factors, data=-1, dtype=int)
+        cluster_stress = pd.DataFrame(index=idx)
+        gate_by_cluster_stress = False  # cannot gate without cluster stress
+    else:
+        cluster_map = pd.Series(cl_map).reindex(factors).fillna(-1).astype(int)
+        cluster_stress = pd.DataFrame(cl_stress).reindex(idx).ffill().fillna(0.0)
+
+    # Driver (dtype move) must exist
+    drv = mkt_change[dtype].reindex(idx).fillna(0.0).astype(float)
+
+    # Exposures: E_base in DV01(dtype units) per factor
+    E_base = (
+        pd.DataFrame(cum_risk)
+        .reindex(idx)
+        .reindex(columns=factors)
+        .fillna(0.0)
+        .astype(float)
+    )
+
+    # DV01 per factor (in dtype units): used for sizing
+    DV01_dtype = (
+        pd.DataFrame(risk_ts)
+        .reindex(idx)
+        .reindex(columns=factors)
+        .fillna(0.0)
+        .astype(float)
+    )
+
+    # =========================================================
+    # A) Hedge intensity α(t) (spot)
+    # =========================================================
+    alpha_t = _map_alpha(stress_global, float(tau1), float(tau2), float(tau3)).rename("alpha")
+
+    # Optional gate: only trade factors whose cluster is stressed today
+    def _cluster_is_stressed(t, factor) -> bool:
+        if not gate_by_cluster_stress:
+            return True
+        cid = int(cluster_map.get(factor, -1))
+        if cid < 0 or cid not in cluster_stress.columns:
+            return False
+        return bool(float(cluster_stress.loc[t, cid]) >= float(cluster_thr))
+
+    # =========================================================
+    # B) Rolling β(proxy | dtype): ΔPnL_f ~ β_f * ΔM_dtype (no intercept)
+    # =========================================================
+    dPnL = pnl_by_factor.diff().replace([np.inf, -np.inf], np.nan)
+    dM = drv.diff().fillna(0.0)  # consistent differencing
+
+    # Compute rolling beta matrix [t x factor]
+    beta_df = pd.DataFrame(1.0, index=idx, columns=factors, dtype=float)
+
+    if int(beta_win) >= 30:
+        for f in factors:
+            y = dPnL[f].reindex(idx)
+            x = dM.reindex(idx)
+            df_xy = pd.concat([x, y], axis=1).dropna()
+            if len(df_xy) < int(beta_win):
+                continue
+            x_all = df_xy.iloc[:, 0].values
+            y_all = df_xy.iloc[:, 1].values
+
+            # rolling OLS (no intercept) in pure numpy (fast enough for ~hundreds factors)
+            b = np.full(len(df_xy), np.nan, dtype=float)
+            w = int(beta_win)
+            for i in range(w - 1, len(df_xy)):
+                xs = x_all[i - w + 1:i + 1]
+                ys = y_all[i - w + 1:i + 1]
+                b[i] = _beta_ols_noint(xs, ys)
+            beta_series = pd.Series(b, index=df_xy.index).reindex(idx).ffill().fillna(1.0)
+            beta_df[f] = beta_series.clip(lower=-50.0, upper=50.0)  # guardrails
+    else:
+        beta_df.loc[:, :] = 1.0
+
+    # =========================================================
+    # C) Cross-hedge rule for XCCY self-hedge avoidance
+    # =========================================================
+    # If dtype is XCCY and factor == dtype, allow proxy selection among Rates/FX by corr on ΔPnL
+    best_proxy_for_dtype = None
+    if _bucket(dtype) == "XCCY" and dtype in dPnL.columns:
+        corr = dPnL.corrwith(dPnL[dtype]).drop(index=dtype).dropna()
+        if not corr.empty:
+            allowed = [c for c in corr.index if _bucket(c) in ("Rates", "FX")]
+            if allowed:
+                corr_abs = corr.loc[allowed].abs()
+                corr_abs = corr_abs[corr_abs >= float(min_abs_corr)]
+                if not corr_abs.empty:
+                    best_proxy_for_dtype = corr_abs.idxmax()
+
+    # =========================================================
+    # D) Hedge plan construction
+    # =========================================================
+    plan_rows = []
+    cost_series = pd.Series(0.0, index=idx, dtype=float)
+
+    for t in idx:
+        a = float(alpha_t.loc[t])
+        if a <= 0.0:
+            continue
+
+        # scoring to pick TopN:
+        # use contemporaneous info only (PnL contribution and DV01 magnitude)
+        pnl_row = pnl_by_factor.loc[t].reindex(factors).fillna(0.0).astype(float)
+        dv01_row = DV01_dtype.loc[t].reindex(factors).fillna(0.0).astype(float)
+        score = (pnl_row.abs() * dv01_row.abs()).replace([np.inf, -np.inf], 0.0)
+
+        # initial ranking
+        candidates = score.sort_values(ascending=False).index.tolist()
+
+        # optionally enforce 1 per cluster
+        selected = []
+        used_clusters = set()
+        for f in candidates:
+            if len(selected) >= int(topN):
+                break
+            if score.get(f, 0.0) <= 0.0:
+                break
+            if not _cluster_is_stressed(t, f):
+                continue
+            cid = int(cluster_map.get(f, -1))
+            if one_per_cluster and cid in used_clusters:
+                continue
+            if dv01_row.get(f, 0.0) == 0.0:
+                continue
+            selected.append(f)
+            used_clusters.add(cid)
+
+        # execution day
+        t_exec = t if apply_day == "Jour T" else (t + pd.Timedelta(days=1))
+        if t_exec not in idx:
+            continue
+
+        for f in selected:
+            dv01_const_dtype = float(dv01_row.get(f, 0.0))
+            if dv01_const_dtype == 0.0:
+                continue
+
+            # proxy choice
+            proxy = f
+            if (_bucket(dtype) == "XCCY") and (f == dtype) and (best_proxy_for_dtype is not None):
+                proxy = best_proxy_for_dtype
+
+            beta = float(beta_df.loc[t, proxy]) if proxy in beta_df.columns else 1.0
+            if not np.isfinite(beta) or abs(beta) < 1e-6:
+                beta = 1.0
+
+            # translate DV01(dtype) -> proxy own DV01
+            dv01_proxy_own = dv01_const_dtype / beta
+
+            # hedge in own units (persistent position increments)
+            hedge_own = -a * dv01_proxy_own
+
+            # exposure impact expressed back in dtype units (for PnL reconstruction)
+            hedge_dtype = hedge_own * beta  # = -a * dv01_const_dtype
+
+            bucket = _bucket(proxy)
+            unit_cost = _unit_cost(bucket, cost_rate, cost_xccy, cost_fx)
+
+            cost = abs(hedge_own) * unit_cost
+            cost_series.loc[t_exec] += float(cost)
+
+            plan_rows.append({
+                "SignalDate": t,
+                "ExecDate": t_exec,
+                "Cluster": int(cluster_map.get(f, -1)),
+                "Factor": f,
+                "Proxy": proxy,
+                "Bucket": bucket,
+                "alpha": a,
+                "DV01_const_dtype": dv01_const_dtype,
+                "beta_proxy_vs_dtype": beta,
+                "DV01_proxy_own": dv01_proxy_own,
+                "HedgeUnits_own": hedge_own,
+                "HedgeUnits_dtype": hedge_dtype,
+                "UnitCost": unit_cost,
+                "Cost": cost,
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+
+    st.markdown("### Hedge plan (historical)")
+    if plan_df.empty:
+        st.info("No hedge triggered (α(t)=0 or filters too tight).")
+    else:
+        st.dataframe(
+            plan_df.sort_values(["ExecDate", "Cluster", "Factor", "Proxy"]).style.format({
+                "alpha": "{:.2f}",
+                "DV01_const_dtype": "{:,.0f}",
+                "beta_proxy_vs_dtype": "{:.3f}",
+                "DV01_proxy_own": "{:,.0f}",
+                "HedgeUnits_own": "{:,.0f}",
+                "HedgeUnits_dtype": "{:,.0f}",
+                "UnitCost": "{:.3f}",
+                "Cost": "{:,.0f}",
+            }),
+            use_container_width=True,
+            height=420
+        )
+
+    # =========================================================
+    # E) Build persistent hedge exposure H(t) in dtype units per factor column space
+    # =========================================================
+    if plan_df.empty:
+        H_dtype = pd.DataFrame(0.0, index=idx, columns=factors, dtype=float)
+    else:
+        # Aggregate by execution date and proxy (proxy is a tradable factor name)
+        hedge_delta = (
+            plan_df.groupby(["ExecDate", "Proxy"])["HedgeUnits_dtype"]
+                   .sum()
+                   .unstack(fill_value=0.0)
+                   .reindex(idx, fill_value=0.0)
+        )
+        hedge_delta = hedge_delta.reindex(columns=factors, fill_value=0.0)
+        H_dtype = hedge_delta.cumsum()
+
+    # =========================================================
+    # F) PnL reconstruction (baseline vs hedged), consistent with Tab1 mechanics
+    # =========================================================
+    # Baseline from exposures carried (t-1) to driver move at t
+    pnl_base = (E_base.shift(1).mul(drv, axis=0)).sum(axis=1).rename("PnL_base")
+
+    # Hedged exposure = base + hedge (persistent), both carried with shift(1)
+    E_tot = (E_base.add(H_dtype, fill_value=0.0)).shift(1).fillna(0.0)
+    pnl_after = ((E_tot.mul(drv, axis=0)).sum(axis=1) - cost_series).rename("PnL_hedged")
+
+    cum_base = pnl_base.cumsum().rename("Cum_base")
+    cum_after = pnl_after.cumsum().rename("Cum_hedged")
+
+    st.markdown("### Backtest PnL — base vs hedged")
+    fig, ax = plt.subplots(figsize=(12, 4), dpi=120)
+    ax.plot(cum_base.index, cum_base.values, label="Cumulative Base")
+    ax.plot(cum_after.index, cum_after.values, label="Cumulative Hedged")
+    auto_xticks(ax, idx)
+    format_yaxis_plain(ax)
+    ax.set_title("Cumulative PnL — Base vs Hedged (spot signal, persistent hedge)")
+    ax.legend(loc="upper left")
+    st.pyplot(fig)
+
+    k1, k2, k3 = st.columns(3)
+    with k1:
+        st.metric("Δ Cum (Hedged - Base)", f"{float(cum_after.iloc[-1] - cum_base.iloc[-1]):,.0f}")
+    with k2:
+        st.metric("Total hedge cost", f"{float(cost_series.sum()):,.0f}")
+    with k3:
+        st.metric("% days hedged", f"{100.0 * float((alpha_t > 0).mean()):.1f}%")
+
+    # Optional: cluster-level view of hedged vs base PnL (diagnostic)
+    with st.expander("Diagnostics — per-cluster hedge activity", expanded=False):
+        if plan_df.empty:
+            st.write("No trades.")
+        else:
+            by_cl = (plan_df.groupby(["ExecDate", "Cluster"])["Cost"].sum().unstack(fill_value=0.0).reindex(idx, fill_value=0.0))
+            st.dataframe(by_cl.tail(250), use_container_width=True, height=280)
+
+
+with tab4:
+    st.subheader("TAB 4 — Anticipation Engine (XGBoost) — Global & Cluster Stress Forecast")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    from sklearn.model_selection import TimeSeriesSplit
+    from sklearn.metrics import roc_auc_score
+    from xgboost import XGBClassifier
+
+    eps = 1e-12
+
+    # =========================================================
+    # 0) Helpers
+    # =========================================================
+    def rstd(x, w):
+        return x.rolling(w, min_periods=max(5, w//2)).std()
+
+    def rmean(x, w):
+        return x.rolling(w, min_periods=max(5, w//2)).mean()
+
+    def dedup(x):
+        if isinstance(x, (pd.Series, pd.DataFrame)) and x.index.has_duplicates:
+            return x[~x.index.duplicated(keep="last")]
+        return x
+
+    # =========================================================
+    # 1) Load TAB 2 outputs
+    # =========================================================
+    pc1 = dedup(st.session_state.get("TAB2_PC1_SCORE"))
+    pc2 = dedup(st.session_state.get("TAB2_PC2_SCORE"))
+    s1  = dedup(st.session_state.get("TAB2_PCA_STRESS_PC1"))
+    s2  = dedup(st.session_state.get("TAB2_PCA_STRESS_PC2"))
+
+    cl_map    = st.session_state.get("TAB2_CLUSTER_MAP")      # factor → cluster
+    cl_stress = st.session_state.get("TAB2_CLUSTER_STRESS")   # date × cluster
+
+    if any(v is None for v in [pc1, pc2, s1, s2, cl_map, cl_stress]):
+        st.error("TAB 2 outputs missing. Run TAB 2 first.")
+        st.stop()
+
+    pc1, pc2 = pc1.astype(float), pc2.astype(float)
+    s1, s2   = s1.astype(float), s2.astype(float)
+
+    idx = pc1.index
+
+    stress_spot = pd.concat([s1, s2], axis=1).max(axis=1)
+
+    # =========================================================
+    # 2) UI
+    # =========================================================
+    c1, c2, c3 = st.columns(3)
+    with c1:
+        win = st.slider("Feature window (days)", 20, 180, 60, 10)
+    with c2:
+        n_splits = st.slider("Walk-forward folds", 3, 10, 5, 1)
+    with c3:
+        stress_thr = st.slider("Stress label threshold", 0.3, 0.9, 0.7, 0.05)
+
+    show_shap = st.checkbox("Show SHAP (global model)", value=True)
+
+    # =========================================================
+    # 3) GLOBAL MODEL — features & label
+    # =========================================================
+    Xg = pd.DataFrame(index=idx)
+    Xg["pc1"] = pc1
+    Xg["pc2"] = pc2
+    Xg["d_pc1"] = pc1.diff()
+    Xg["d_pc2"] = pc2.diff()
+    Xg["pc1_vol"] = rstd(pc1, win)
+    Xg["pc2_vol"] = rstd(pc2, win)
+    Xg["stress_spot"] = stress_spot
+    Xg["stress_trend"] = stress_spot.diff()
+    Xg["stress_ma"] = rmean(stress_spot, win)
+
+    y_global = (stress_spot.shift(-1) > stress_thr).astype(int)
+
+    data_g = Xg.join(y_global.rename("y")).dropna()
+    Xg_all = data_g.drop(columns="y")
+    yg_all = data_g["y"]
+
+    # =========================================================
+    # 4) Walk-forward validation (GLOBAL)
+    # =========================================================
+    tss = TimeSeriesSplit(n_splits=n_splits)
+    aucs = []
+
+    for tr, te in tss.split(Xg_all):
+        mdl = XGBClassifier(
+            n_estimators=300,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            eval_metric="logloss",
+            random_state=42
+        )
+        mdl.fit(Xg_all.iloc[tr], yg_all.iloc[tr])
+        p = mdl.predict_proba(Xg_all.iloc[te])[:, 1]
+        if len(np.unique(yg_all.iloc[te])) > 1:
+            aucs.append(roc_auc_score(yg_all.iloc[te], p))
+
+    st.metric("Global model OOF AUC", f"{np.mean(aucs):.3f}")
+
+    # Final fit
+    model_g = XGBClassifier(
+        n_estimators=300,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        eval_metric="logloss",
+        random_state=42
+    )
+    model_g.fit(Xg_all, yg_all)
+
+    p_global = pd.Series(
+        model_g.predict_proba(Xg_all)[:, 1],
+        index=Xg_all.index,
+        name="p_global_T+1"
+    ).reindex(idx).ffill()
+
+    # =========================================================
+    # 5) CLUSTER MODEL — long format
+    # =========================================================
+    cl_map = pd.Series(cl_map)
+    cl_stress = pd.DataFrame(cl_stress).reindex(idx).ffill()
+
+    rows = []
+    for cid in cl_stress.columns:
+        s_c = cl_stress[cid]
+        y_c = (s_c.shift(-1) > stress_thr).astype(int)
+
+        df = pd.DataFrame({
+            "cluster": cid,
+            "stress": s_c,
+            "d_stress": s_c.diff(),
+            "stress_ma": rmean(s_c, win),
+            "stress_vol": rstd(s_c, win),
+            "pc1": pc1,
+            "pc2": pc2,
+            "p_global": p_global
+        })
+        df["y"] = y_c
+        rows.append(df)
+
+    dfC = pd.concat(rows).dropna()
+    yC = dfC["y"]
+    XC = pd.get_dummies(dfC.drop(columns="y"), columns=["cluster"])
+
+    # Walk-forward by date
+    dates = dfC.index.unique()
+    tss2 = TimeSeriesSplit(n_splits=n_splits)
+    aucs_c = []
+
+    for tr_d, te_d in tss2.split(dates):
+        tr_dates = dates[tr_d]
+        te_dates = dates[te_d]
+
+        tr = XC.index.isin(tr_dates)
+        te = XC.index.isin(te_dates)
+
+        mdl = XGBClassifier(
+            n_estimators=250,
+            max_depth=3,
+            learning_rate=0.05,
+            subsample=0.9,
+            colsample_bytree=0.9,
+            eval_metric="logloss",
+            random_state=123
+        )
+        mdl.fit(XC.loc[tr], yC.loc[tr])
+        p = mdl.predict_proba(XC.loc[te])[:, 1]
+        if len(np.unique(yC.loc[te])) > 1:
+            aucs_c.append(roc_auc_score(yC.loc[te], p))
+
+    st.metric("Cluster model OOF AUC", f"{np.mean(aucs_c):.3f}")
+
+    # Final cluster fit
+    model_c = XGBClassifier(
+        n_estimators=250,
+        max_depth=3,
+        learning_rate=0.05,
+        subsample=0.9,
+        colsample_bytree=0.9,
+        eval_metric="logloss",
+        random_state=123
+    )
+    model_c.fit(XC, yC)
+
+    pC = model_c.predict_proba(XC)[:, 1]
+    p_cluster = (
+        pd.DataFrame({"date": XC.index, "cluster": dfC["cluster"], "p": pC})
+        .pivot_table(index="date", columns="cluster", values="p", aggfunc="mean")
+        .reindex(idx)
+        .ffill()
+    )
+
+    # =========================================================
+    # 6) Visuals
+    # =========================================================
+    fig, ax = plt.subplots(figsize=(12, 3.5), dpi=120)
+    ax.plot(p_global.index, p_global, label="P(global stress T+1)")
+    ax.set_ylim(0, 1)
+    ax.set_title("Global stress probability (T+1)")
+    auto_xticks(ax, idx)
+    ax.legend()
+    st.pyplot(fig)
+
+    with st.expander("Cluster stress probabilities (T+1)", expanded=True):
+        fig2, ax2 = plt.subplots(figsize=(12, 4), dpi=120)
+        im = ax2.imshow(p_cluster.T.values, aspect="auto")
+        ax2.set_yticks(range(len(p_cluster.columns)))
+        ax2.set_yticklabels([f"Cl {c}" for c in p_cluster.columns])
+        ax2.set_title("P(cluster stress T+1)")
+        fig2.colorbar(im, ax=ax2)
+        st.pyplot(fig2)
+
+    # =========================================================
+    # 7) SHAP — interpretability (GLOBAL)
+    # =========================================================
+    if show_shap:
+        with st.expander("SHAP — Global model"):
+            import shap
+            explainer = shap.TreeExplainer(model_g)
+            Xs = Xg_all.tail(600)
+            sv = explainer.shap_values(Xs)
+
+            figS = plt.figure(figsize=(10, 4))
+            shap.summary_plot(sv, Xs, plot_type="bar", show=False)
+            st.pyplot(figS)
+
+            figS2 = plt.figure(figsize=(10, 4))
+            shap.summary_plot(sv, Xs, show=False)
+            st.pyplot(figS2)
+
+    st.success("TAB 4 ready — anticipation only (no execution, no backtest).")
+
+with tab2:
+    st.subheader("TAB 2 — STRUCTURAL RISK MAP (PCA global + Clusters + PCA par cluster)")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from sklearn.cluster import KMeans
+
+    eps = 1e-12
+
+    # =========================================================
+    # 0) Helpers
+    # =========================================================
+    def _dedup_index(x):
+        if isinstance(x, (pd.Series, pd.DataFrame)) and x.index.has_duplicates:
+            return x[~x.index.duplicated(keep="last")]
+        return x
+
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if ("FX" in u) or ("FX_COLS" in globals() and name in FX_COLS):
+            return "FX"
+        if ("XCCY" in u) or ("BASIS" in u):
+            return "XCCY"
+        return "Rates"
+
+    def _z_to_stress(z: pd.Series, z_clip: float = 3.0) -> pd.Series:
+        # stress in [0,1] using |z| / z_clip
+        s = (z.abs() / float(z_clip)).clip(0.0, 1.0)
+        return s.astype(float)
+
+    def _safe_corr(df: pd.DataFrame) -> pd.DataFrame:
+        c = df.corr().replace([np.inf, -np.inf], np.nan).fillna(0.0)
+        # numerical safety: clamp
+        return c.clip(-1.0, 1.0)
+
+    def _ensure_min_cluster_size(cluster_map: pd.Series, corr: pd.DataFrame, min_size: int = 2) -> pd.Series:
+        """
+        If a cluster has < min_size members, re-assign its members to the
+        cluster where they have the highest average absolute correlation.
+        """
+        cm = cluster_map.copy().astype(int)
+        changed = True
+        while changed:
+            changed = False
+            counts = cm.value_counts()
+            small = counts[counts < min_size].index.tolist()
+            if not small:
+                break
+            for cid in small:
+                members = cm[cm == cid].index.tolist()
+                if not members:
+                    continue
+                # candidate clusters excluding itself
+                candidates = [k for k in counts.index if k != cid and counts[k] >= min_size]
+                if not candidates:
+                    # nothing to merge into: keep as is
+                    continue
+                for f in members:
+                    # assign to cluster maximizing avg |corr| to that cluster
+                    best_k, best_score = None, -np.inf
+                    for k in candidates:
+                        m2 = cm[cm == k].index
+                        if len(m2) == 0:
+                            continue
+                        score = float(corr.loc[f, m2].abs().mean())
+                        if score > best_score:
+                            best_score, best_k = score, k
+                    if best_k is not None:
+                        cm.loc[f] = int(best_k)
+                        changed = True
+            # refresh counts for next pass
+        return cm
+
+    # =========================================================
+    # A) Inputs + params
+    # =========================================================
+    pnl_by_factor = _dedup_index(pnl_by_factor)
+    net_daily = _dedup_index(net_daily)
+
+    factors = list(pnl_by_factor.columns)
+    idx = pnl_by_factor.index
+
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        pca_win = st.slider("Rolling window (days) for PCA z-score", 30, 520, 250, 10, key="t2_pca_win")
+    with c2:
+        z_clip = st.slider("Z clip → stress in [0,1] (|z|/clip)", 2.0, 6.0, 3.0, 0.5, key="t2_zclip")
+    with c3:
+        use_bucket_kmeans = st.checkbox("KMeans per bucket (Rates/XCCY/FX)", value=True, key="t2_bucket_kmeans")
+    with c4:
+        k_per_bucket = st.slider("K max per bucket", 1, 10, 3, 1, key="t2_k_per_bucket")
+
+    d1, d2, d3 = st.columns(3)
+    with d1:
+        min_cluster_size = st.slider("Min cluster size", 1, 5, 2, 1, key="t2_min_cl_size")
+    with d2:
+        show_heatmap = st.checkbox("Show corr heatmap", value=False, key="t2_heatmap")
+    with d3:
+        show_cluster_pca = st.checkbox("Compute PCA inside clusters", value=True, key="t2_cluster_pca")
+
+    # =========================================================
+    # B) Build dPnL (shock space)
+    # =========================================================
+    dPnL = pnl_by_factor.diff().replace([np.inf, -np.inf], np.nan).dropna(how="any")
+    if len(dPnL) < 60:
+        st.warning("Not enough history after diff/dropna to run stable PCA/Clustering.")
+        st.stop()
+
+    # =========================================================
+    # C) Global PCA on dPnL (PC1/PC2 + stress)
+    # =========================================================
+    X = dPnL.values
+    Xs = StandardScaler().fit_transform(X)
+
+    pca_g = PCA(n_components=2, random_state=42)
+    scores = pca_g.fit_transform(Xs)
+    pc1_score = pd.Series(scores[:, 0], index=dPnL.index, name="PC1_score")
+    pc2_score = pd.Series(scores[:, 1], index=dPnL.index, name="PC2_score")
+
+    # rolling z-score (no leakage beyond t)
+    w = int(pca_win)
+    pc1_mu = pc1_score.rolling(w, min_periods=max(20, w // 2)).mean()
+    pc1_sd = pc1_score.rolling(w, min_periods=max(20, w // 2)).std(ddof=1)
+    pc2_mu = pc2_score.rolling(w, min_periods=max(20, w // 2)).mean()
+    pc2_sd = pc2_score.rolling(w, min_periods=max(20, w // 2)).std(ddof=1)
+
+    pc1_z = ((pc1_score - pc1_mu) / (pc1_sd + eps)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+    pc2_z = ((pc2_score - pc2_mu) / (pc2_sd + eps)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+    stress_pc1 = _z_to_stress(pc1_z, z_clip=float(z_clip)).rename("PCA_stress_PC1")
+    stress_pc2 = _z_to_stress(pc2_z, z_clip=float(z_clip)).rename("PCA_stress_PC2")
+
+    # reindex to full pnl index for downstream tabs
+    pc1_score_full = pc1_score.reindex(idx).ffill().fillna(0.0)
+    pc2_score_full = pc2_score.reindex(idx).ffill().fillna(0.0)
+    stress_pc1_full = stress_pc1.reindex(idx).ffill().fillna(0.0)
+    stress_pc2_full = stress_pc2.reindex(idx).ffill().fillna(0.0)
+
+    # store for Tab3/Tab4 compatibility
+    st.session_state["TAB2_PC1_SCORE"] = pc1_score_full
+    st.session_state["TAB2_PC2_SCORE"] = pc2_score_full
+    st.session_state["TAB2_PCA_STRESS_PC1"] = stress_pc1_full
+    st.session_state["TAB2_PCA_STRESS_PC2"] = stress_pc2_full
+
+    # Visual: global PCA stress
+    fig1, ax1 = plt.subplots(figsize=(12, 3.8), dpi=120)
+    ax1.plot(net_daily.reindex(idx).values, lw=1.0, label="net_daily", alpha=0.7)
+    ax2 = ax1.twinx()
+    ax2.plot(stress_pc1_full.index, stress_pc1_full.values, lw=1.2, label="stress_PC1", alpha=0.9)
+    ax2.plot(stress_pc2_full.index, stress_pc2_full.values, lw=1.2, label="stress_PC2", alpha=0.9)
+    ax2.set_ylim(-0.05, 1.05)
+    auto_xticks(ax1, idx)
+    ax1.set_title("Global PCA (dPnL) — net_daily with PCA stress (PC1/PC2)")
+    ax1.legend(loc="upper left")
+    ax2.legend(loc="upper right")
+    st.pyplot(fig1)
+
+    # =========================================================
+    # D) Clustering on corr(dPnL) (KMeans on corr rows)
+    # =========================================================
+    corr = _safe_corr(dPnL)
+
+    buckets = pd.Series({f: _bucket(f) for f in factors}, name="Bucket")
+    cluster_map = pd.Series(index=factors, dtype=int)
+
+    next_cluster_id = 1
+    if use_bucket_kmeans:
+        for bkt in ["Rates", "XCCY", "FX"]:
+            cols_b = [c for c in factors if buckets[c] == bkt]
+            if not cols_b:
+                continue
+
+            corr_b = corr.loc[cols_b, cols_b]
+            k = min(int(k_per_bucket), len(cols_b))
+            if k <= 1:
+                cluster_map.loc[cols_b] = next_cluster_id
+                next_cluster_id += 1
+                continue
+
+            km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+            labels = km.fit_predict(corr_b.values)
+
+            for c, lab in zip(cols_b, labels):
+                cluster_map.loc[c] = next_cluster_id + int(lab)
+            next_cluster_id += k
+    else:
+        # single KMeans on all factors
+        k = min(int(k_per_bucket), len(factors))
+        km = KMeans(n_clusters=k, random_state=42, n_init="auto")
+        labels = km.fit_predict(corr.values)
+        cluster_map.loc[factors] = (labels + 1).astype(int)
+
+    # Enforce min cluster size (avoid singletons)
+    cluster_map = _ensure_min_cluster_size(cluster_map, corr, min_size=int(min_cluster_size)).astype(int)
+
+    # store
+    st.session_state["TAB2_CLUSTER_MAP"] = cluster_map
+
+    cluster_df = pd.DataFrame({
+        "Bucket": buckets.reindex(factors),
+        "Cluster": cluster_map.reindex(factors).astype(int)
+    }).sort_values(["Bucket", "Cluster"])
+
+    with st.expander("Clusters (factor → bucket/cluster)", expanded=False):
+        st.dataframe(cluster_df, use_container_width=True, height=360)
+
+    if show_heatmap:
+        sorted_idx = cluster_df.index.tolist()
+        sorted_corr = corr.loc[sorted_idx, sorted_idx]
+        figH, axH = plt.subplots(figsize=(7, 6), dpi=120)
+        im = axH.imshow(sorted_corr.values, aspect="auto")
+        axH.set_xticks(range(len(sorted_idx)))
+        axH.set_yticks(range(len(sorted_idx)))
+        axH.set_xticklabels(sorted_idx, rotation=90, fontsize=6)
+        axH.set_yticklabels(sorted_idx, fontsize=6)
+        axH.set_title("Corr(dPnL) — sorted by bucket/cluster")
+        figH.colorbar(im, ax=axH, fraction=0.046, pad=0.04)
+        st.pyplot(figH)
+
+    # =========================================================
+    # E) Cluster PCA stress (PC1-only per cluster) → stress_cluster(t, c)
+    # =========================================================
+    cluster_ids = sorted(int(x) for x in cluster_map.unique())
+    stress_cluster = pd.DataFrame(0.0, index=dPnL.index, columns=cluster_ids, dtype=float)
+
+    if show_cluster_pca:
+        for cid in cluster_ids:
+            cols = cluster_map[cluster_map == cid].index.tolist()
+            if len(cols) < 2:
+                continue
+
+            Xc = dPnL[cols].dropna(how="any")
+            if len(Xc) < 60:
+                continue
+
+            Xcs = StandardScaler().fit_transform(Xc.values)
+            pca_c = PCA(n_components=1, random_state=42)
+            sc = pca_c.fit_transform(Xcs).ravel()
+            sc = pd.Series(sc, index=Xc.index)
+
+            mu = sc.rolling(w, min_periods=max(20, w // 2)).mean()
+            sd = sc.rolling(w, min_periods=max(20, w // 2)).std(ddof=1)
+            z = ((sc - mu) / (sd + eps)).replace([np.inf, -np.inf], 0.0).fillna(0.0)
+
+            stress_cluster[cid] = _z_to_stress(z, z_clip=float(z_clip)).reindex(dPnL.index).ffill().fillna(0.0)
+
+    # reindex to full idx
+    stress_cluster_full = stress_cluster.reindex(idx).ffill().fillna(0.0)
+
+    # store for Tab3/Tab4 compatibility
+    st.session_state["TAB2_CLUSTER_STRESS"] = stress_cluster_full
+
+    # Visual: cluster stress snapshot (top few clusters by avg stress)
+    with st.expander("Cluster stress (PCA inside clusters)", expanded=False):
+        if stress_cluster_full.shape[1] == 0:
+            st.write("No cluster stress computed.")
+        else:
+            avg_st = stress_cluster_full.mean().sort_values(ascending=False)
+            top_cols = avg_st.head(min(8, len(avg_st))).index.tolist()
+
+            figC, axC = plt.subplots(figsize=(12, 3.4), dpi=120)
+            for cid in top_cols:
+                axC.plot(stress_cluster_full.index, stress_cluster_full[cid].values, lw=1.1, label=f"Cl {cid}")
+            axC.set_ylim(-0.05, 1.05)
+            axC.set_title("Cluster stress (top clusters by average stress)")
+            auto_xticks(axC, idx)
+            axC.legend(loc="upper left", ncols=2)
+            st.pyplot(figC)
+
+            # summary table
+            summary_rows = []
+            for cid in cluster_ids:
+                cols = cluster_map[cluster_map == cid].index.tolist()
+                s = stress_cluster_full[cid] if cid in stress_cluster_full.columns else pd.Series(index=idx, dtype=float)
+                summary_rows.append({
+                    "Cluster": cid,
+                    "Bucket": cluster_df[cluster_df["Cluster"] == cid]["Bucket"].iloc[0] if (cluster_df["Cluster"] == cid).any() else "",
+                    "N_factors": len(cols),
+                    "Stress_mean": float(s.mean()) if len(s) else 0.0,
+                    "Stress_p95": float(s.quantile(0.95)) if len(s) else 0.0,
+                    "%days stress>0.7": float((s > 0.7).mean() * 100.0) if len(s) else 0.0
+                })
+            summary = pd.DataFrame(summary_rows).set_index("Cluster").sort_values("Stress_mean", ascending=False)
+
+            st.dataframe(
+                summary.style.format({
+                    "Stress_mean": "{:.2f}",
+                    "Stress_p95": "{:.2f}",
+                    "%days stress>0.7": "{:.1f}",
+                }),
+                use_container_width=True,
+                height=320
+            )
+
+    st.success("TAB 2 ready: stored PCA stress + clusters + cluster stress into session_state (compatible with Tab 3/4).")
