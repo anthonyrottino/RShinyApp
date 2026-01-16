@@ -1,0 +1,415 @@
+# ============================================================
+# TAB 3 — À PARTIR DE : PCA + HMM  → gate_day → (PCA×Risque) → hedge table (SIMPLE / QP)
+# ============================================================
+# Prérequis attendus (déjà existants dans ton app) :
+# - pnl_by_factor : DataFrame index=dates, columns=factors  (contrib/PnL par facteur)
+# - risk_ts       : DataFrame index=dates, columns=factors  (DV01/FX01 "units" par facteur)
+# - drivers_loc   : DataFrame index=dates, columns=factors  (drivers marché pour PnL overlay)
+# - E_base        : DataFrame index=dates, columns=factors  (exposition de base, Tab1)
+# - net_daily     : Series/DF index=dates (PnL total tab1, optionnel pour plots)
+# - cost_rate, cost_xccy, cost_fx : floats
+# ------------------------------------------------------------
+
+import numpy as np
+import pandas as pd
+import matplotlib.pyplot as plt
+import matplotlib.colormaps as colormaps
+from sklearn.preprocessing import StandardScaler
+from sklearn.decomposition import PCA
+from hmmlearn.hmm import GaussianHMM
+
+eps = 1e-12
+
+# --------------------------
+# UI (exemple minimal)
+# --------------------------
+hmm_states = st.slider("Nb régimes (HMM)", 2, 6, 3, 1, key="tab3_hmm_states")
+n_iter = st.number_input("n_iter (EM)", 50, 2000, 300, 50, key="tab3_hmm_niter")
+
+alpha_max = st.slider("Alpha max (plafond global)", 0.0, 1.0, 0.40, 0.05, key="tab3_alpha_max")
+apply_day = st.selectbox("Appliquer le hedge", ["Jour T", "Jour T+1"], index=0, key="tab3_apply_day")
+
+p_min = st.slider("Seuil proba min (conviction)", 0.50, 0.95, 0.60, 0.05, key="tab3_pmin")
+pc1_z_th = st.slider("|PC1_z| min", 0.0, 3.0, 1.0, 0.1, key="tab3_pc1z_th")
+win_pc1_z = st.slider("Fenêtre z-score PC1 (jours)", 20, 180, 60, 5, key="tab3_win_pc1z")
+
+win_pca = st.slider("Fenêtre PCA rolling (jours)", 20, 260, 60, 5, key="tab3_win_pca")
+cum_thresh = st.slider("Seuil masse cumulée (PCA×Risque)", 0.50, 0.95, 0.75, 0.05, key="tab3_cum_mass")
+n_min = st.slider("N min facteurs", 1, 10, 1, 1, key="tab3_nmin")
+n_max = st.slider("N max facteurs", 2, 30, 10, 1, key="tab3_nmax")
+
+W_MIN = st.slider("Poids PCA min (cap)", 0.1, 1.0, 0.5, 0.05, key="tab3_wmin")
+W_MAX = st.slider("Poids PCA max (cap)", 1.0, 3.0, 1.5, 0.1, key="tab3_wmax")
+
+cost_rate = st.number_input("Coût — Rates (par DV01)", 0.0, 5.0, 0.20, 0.01, key="tab3_cost_rate")
+cost_xccy = st.number_input("Coût — XCCY (par DV01)", 0.0, 5.0, 0.25, 0.01, key="tab3_cost_xccy")
+cost_fx   = st.number_input("Coût — FX (par FX01)",   0.0, 5.0, 0.00, 0.01, key="tab3_cost_fx")
+
+use_qp = st.checkbox("Utiliser solveur (cvxpy) — simple", value=False, key="tab3_use_qp")
+lam_risk = st.slider("λ risk", 0.0, 5.0, 1.0, 0.1, key="tab3_lam_risk")
+lam_mu   = st.slider("λ mu (direction)", 0.0, 5.0, 0.0, 0.1, key="tab3_lam_mu")  # 0 = hedge pur
+lam_cost = st.slider("λ cost", 0.0, 5.0, 1.0, 0.1, key="tab3_lam_cost")
+h_max_in = st.number_input("h_max (cap par facteur)", 0.0, 1e12, 1e12, 1e9, key="tab3_hmax")
+h_max = None if h_max_in >= 9e11 else float(h_max_in)
+
+# --------------------------
+# Helpers
+# --------------------------
+def _bucket(name: str) -> str:
+    u = str(name).upper()
+    if "FX" in u:
+        return "FX"
+    if "XCCY" in u or "BASIS" in u:
+        return "XCCY"
+    return "Rates"
+
+def cap_and_renorm_mean1_row(w: np.ndarray, w_min: float, w_max: float) -> np.ndarray:
+    w = w / (w.mean() + eps)
+    w = np.clip(w, w_min, w_max)
+    w = w / (w.mean() + eps)
+    return w
+
+def rolling_pc1_weights_fast(X: pd.DataFrame, win: int, power_iter: int = 8) -> np.ndarray:
+    """
+    Perf: standardisation globale + rolling covariance add/remove + power iteration.
+    Retour: W_raw (T,F) mean=1 à partir de t>=win-1, sinon 0.
+    """
+    Xv = X.to_numpy(dtype=float)
+    T, F = Xv.shape
+
+    W = np.zeros((T, F), dtype=float)
+    if T < win or F < 2:
+        return W
+
+    mu = Xv.mean(axis=0)
+    sig = Xv.std(axis=0, ddof=0)
+    sig = np.where(sig < eps, 1.0, sig)
+    Z = (Xv - mu) / sig
+
+    M = np.zeros((F, F), dtype=float)
+    for i in range(win):
+        zi = Z[i].reshape(-1, 1)
+        M += zi @ zi.T
+
+    v = np.ones(F, dtype=float)
+    v /= (np.linalg.norm(v) + eps)
+
+    for t in range(win - 1, T):
+        if t >= win:
+            z_add = Z[t].reshape(-1, 1)
+            z_rem = Z[t - win].reshape(-1, 1)
+            M += z_add @ z_add.T
+            M -= z_rem @ z_rem.T
+
+        S = M / max(1, (win - 1))
+        vt = v
+        for _ in range(power_iter):
+            vt = S @ vt
+            nrm = np.linalg.norm(vt)
+            if nrm < eps:
+                vt = np.ones(F, dtype=float) / np.sqrt(F)
+                break
+            vt /= nrm
+        v = vt
+
+        w = np.abs(v)
+        w = w / (w.mean() + eps)  # mean=1
+        W[t, :] = w
+
+    return W
+
+def solve_qp_subset(risk_s: pd.Series, cov_df: pd.DataFrame, mu_s: pd.Series, unit_cost_s: pd.Series,
+                    lam_risk=1.0, lam_mu=0.0, lam_cost=1.0, h_max=None) -> pd.Series:
+    """
+    Solveur cvxpy sur un subset (facteurs du jour).
+    Objective: lam_risk*(r+h)'S(r+h) - lam_mu*mu'h + lam_cost*sum(cost*|h|)
+    """
+    import cvxpy as cp
+    fac = risk_s.index.tolist()
+
+    r = risk_s.to_numpy(float)
+    m = mu_s.reindex(fac).fillna(0.0).to_numpy(float)
+    c = unit_cost_s.reindex(fac).fillna(0.0).to_numpy(float)
+    S = cov_df.reindex(index=fac, columns=fac).fillna(0.0).to_numpy(float)
+    S = 0.5 * (S + S.T)
+
+    n = len(fac)
+    h = cp.Variable(n)
+
+    obj = cp.Minimize(
+        lam_risk * cp.quad_form(r + h, S)
+        - lam_mu * (m @ h)
+        + lam_cost * cp.sum(cp.multiply(c, cp.abs(h)))
+    )
+
+    cons = []
+    if h_max is not None:
+        cons += [h <= h_max, h >= -h_max]
+
+    prob = cp.Problem(obj, cons)
+    prob.solve(solver=cp.OSQP, warm_start=True, verbose=False)
+
+    if h.value is None:
+        return pd.Series(0.0, index=fac)
+
+    return pd.Series(np.asarray(h.value).ravel(), index=fac)
+
+# --------------------------
+# Align data
+# --------------------------
+pnl_df = pnl_by_factor.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+idx_all = pnl_df.index
+cols = pnl_df.columns.tolist()
+
+risk_df = risk_ts.reindex(idx_all).reindex(columns=cols).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+drivers = drivers_loc.reindex(idx_all).reindex(columns=cols).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+E_base = E_base.reindex(idx_all).reindex(columns=cols).replace([np.inf, -np.inf], np.nan).fillna(0.0)
+
+X_hmm = pnl_df.values
+X_use = StandardScaler().fit_transform(X_hmm)
+
+# ============================================================
+# 1) HMM : posteriors + regime hard + switch
+# ============================================================
+hmm = GaussianHMM(
+    n_components=int(hmm_states),
+    covariance_type="full",
+    n_iter=int(n_iter),
+    random_state=42
+)
+hmm.fit(X_use)
+
+post = pd.DataFrame(
+    hmm.predict_proba(X_use),
+    index=idx_all,
+    columns=[f"Regime_{i}" for i in range(int(hmm_states))]
+)
+regime_hard = pd.Series(post.values.argmax(axis=1), index=idx_all, name="regime")
+p_regime = post.max(axis=1).rename("p_regime")
+is_switch = regime_hard.ne(regime_hard.shift(1)).fillna(False).rename("is_switch")
+
+# ============================================================
+# 2) PCA : PC1 score + z-score (pour gate_day)
+# ============================================================
+Xz = StandardScaler().fit_transform(pnl_df.values)
+pca1 = PCA(n_components=1, random_state=42)
+pc1_score = pd.Series(pca1.fit_transform(Xz).ravel(), index=idx_all, name="PC1_score")
+
+roll = pc1_score.rolling(int(win_pc1_z), min_periods=max(20, int(win_pc1_z)//2))
+pc1_z = ((pc1_score - roll.mean()) / (roll.std(ddof=0) + eps)).rename("PC1_z")
+
+# gate_day = proba × PCA_z, only switch days (reco)
+gate_p = ((p_regime - float(p_min)) / (1.0 - float(p_min))).clip(0, 1).fillna(0.0)
+gate_pc1 = (pc1_z.abs() / float(pc1_z_th)).clip(0, 1).fillna(0.0)
+gate_day = (gate_p * gate_pc1).where(is_switch, 0.0).rename("gate_day")
+gate_arr = gate_day.to_numpy(float)
+
+# ============================================================
+# 3) PCA rolling weights (perf) + cap (pas de poids délirants)
+# ============================================================
+W_raw = rolling_pc1_weights_fast(pnl_df, win=int(win_pca), power_iter=8)
+
+# fallback avant fenêtre : poids neutres
+if len(idx_all) >= int(win_pca):
+    W_raw[:int(win_pca)-1, :] = 1.0
+else:
+    W_raw[:, :] = 1.0
+
+W = W_raw.copy()
+for t in range(W.shape[0]):
+    W[t, :] = cap_and_renorm_mean1_row(W[t, :], float(W_MIN), float(W_MAX))
+
+# ============================================================
+# 4) Option A : Score = |W| × |Risk|  → sélection N via masse cumulée
+# ============================================================
+R = risk_df.to_numpy(float)              # (T,F)
+S = np.abs(W) * np.abs(R)                # (T,F)
+
+order = np.argsort(-S, axis=1)           # (T,F)
+S_sorted = np.take_along_axis(S, order, axis=1)
+denom = S_sorted.sum(axis=1, keepdims=True) + eps
+cum = np.cumsum(S_sorted, axis=1) / denom
+
+hit = (cum >= float(cum_thresh))
+first_k = np.argmax(hit, axis=1) + 1
+never = ~hit.any(axis=1)
+first_k[never] = 1
+n_sel = np.clip(first_k, int(n_min), int(n_max))
+
+top_idx_list = [order[t, :n_sel[t]].copy() for t in range(len(idx_all))]
+
+# ============================================================
+# 5) Covariance pour QP (simple): covariance globale des drivers
+# ============================================================
+cov_df = drivers.cov().reindex(index=cols, columns=cols).fillna(0.0)
+
+unit_cost_by_col = np.array([
+    cost_rate if _bucket(c) == "Rates" else (cost_xccy if _bucket(c) == "XCCY" else cost_fx)
+    for c in cols
+], dtype=float)
+
+# ============================================================
+# 6) (Optionnel) Plot régimes
+# ============================================================
+if "net_daily" in globals():
+    net_series = net_daily.reindex(idx_all)
+    if isinstance(net_series, pd.DataFrame):
+        net_series = net_series.iloc[:, 0]
+    net_series = pd.to_numeric(net_series, errors="coerce").fillna(0.0)
+
+    figR, axR = plt.subplots(figsize=(12, 4.5), dpi=120)
+    axR.plot(net_series.index, net_series.values, lw=1.1, label="PnL quotidien")
+    cmap = colormaps["tab10"]
+    for s_id in range(int(hmm_states)):
+        mask = (regime_hard == s_id).reindex(idx_all).fillna(False).to_numpy()
+        axR.fill_between(net_series.index, net_series.values, 0.0, where=mask,
+                         alpha=0.12, color=cmap(s_id % 10), label=f"Regime {s_id}")
+    axR.set_title("HMM — Régimes (hard) sur PnL")
+    axR.legend(loc="upper left", ncols=2)
+    st.pyplot(figR)
+
+st.subheader("Diagnostics (gate & N)")
+st.line_chart(pd.DataFrame({
+    "p_regime": p_regime,
+    "PC1_z": pc1_z,
+    "gate_day": gate_day,
+    "N_selected": pd.Series([len(x) for x in top_idx_list], index=idx_all)
+}))
+
+# ============================================================
+# 7) Build hedge plan table (SIMPLE / QP) + positions persistantes + coûts
+# ============================================================
+plan_rows = []
+T, F = len(idx_all), len(cols)
+
+hedge_delta = np.zeros((T, F), dtype=float)
+cost_series = pd.Series(0.0, index=idx_all)
+
+col_arr = np.array(cols)
+
+for t, d in enumerate(idx_all):
+    alpha_day = float(alpha_max * gate_arr[t])
+    if alpha_day <= 0.0:
+        continue
+
+    top_idx = top_idx_list[t]
+    if top_idx.size == 0:
+        continue
+
+    target_day = d if apply_day == "Jour T" else (d + pd.Timedelta(days=1))
+    if target_day not in idx_all:
+        continue
+    t_target = idx_all.get_loc(target_day)
+
+    fac_sub = col_arr[top_idx].tolist()
+
+    # subset Series
+    w_sub = pd.Series(W[t, top_idx], index=fac_sub)
+    risk_sub = pd.Series(R[t, top_idx], index=fac_sub)
+    alpha_used_sub = (alpha_day * w_sub)
+
+    unit_cost_sub = pd.Series(
+        {f: float(unit_cost_by_col[cols.index(f)]) for f in fac_sub},
+        index=fac_sub
+    )
+
+    # direction attendue (simple = hedge pur)
+    mu_sub = pd.Series(0.0, index=fac_sub)
+
+    # Solveur ou fallback
+    if use_qp:
+        try:
+            h_opt = solve_qp_subset(
+                risk_s=risk_sub,
+                cov_df=cov_df,
+                mu_s=mu_sub,
+                unit_cost_s=unit_cost_sub,
+                lam_risk=float(lam_risk),
+                lam_mu=float(lam_mu),
+                lam_cost=float(lam_cost),
+                h_max=h_max,
+            )
+            mode_tag = "QP"
+        except Exception:
+            h_opt = (-alpha_used_sub * risk_sub)
+            mode_tag = "SIMPLE"
+    else:
+        h_opt = (-alpha_used_sub * risk_sub)
+        mode_tag = "SIMPLE"
+
+    for f in fac_sub:
+        hedge_units = float(h_opt.get(f, 0.0))
+        if (not np.isfinite(hedge_units)) or abs(hedge_units) < 1e-12:
+            continue
+
+        j = cols.index(f)
+
+        # trade
+        hedge_delta[t_target, j] += hedge_units
+
+        # cost
+        unit_cost = float(unit_cost_sub.get(f, 0.0))
+        cost_series.iloc[t_target] += abs(hedge_units) * unit_cost
+
+        plan_rows.append({
+            "Date": target_day,
+            "Mode": mode_tag,
+            "Constituant": f,
+            "Bucket": _bucket(f),
+            "AlphaDay": float(alpha_day),
+            "W_pca": float(w_sub.get(f, np.nan)),
+            "AlphaUsed": float(alpha_used_sub.get(f, np.nan)),
+            "Risk_target": float(risk_sub.get(f, np.nan)),
+            "HedgeUnits": float(hedge_units),
+            "UnitCost": float(unit_cost),
+            "CostAlloc": float(abs(hedge_units) * unit_cost),
+        })
+
+plan_df = pd.DataFrame(plan_rows)
+
+st.subheader("Plan de hedge (complet)")
+if plan_df.empty:
+    st.info("Aucun hedge déclenché (gate_day=0 ou sélection vide).")
+else:
+    st.dataframe(
+        plan_df.sort_values(["Date", "Constituant"]).style.format({
+            "AlphaDay": "{:.3f}",
+            "W_pca": "{:.3f}",
+            "AlphaUsed": "{:.3f}",
+            "Risk_target": "{:,.0f}",
+            "HedgeUnits": "{:,.0f}",
+            "UnitCost": "{:.3f}",
+            "CostAlloc": "{:,.0f}",
+        }),
+        use_container_width=True,
+        height=440
+    )
+
+# ============================================================
+# 8) PnL base vs hedgé (positions persistantes)
+# ============================================================
+H = pd.DataFrame(hedge_delta, index=idx_all, columns=cols).cumsum()
+
+pnl_base = (E_base.shift(1).mul(drivers, axis=0)).sum(axis=1).rename("PnL_base")
+pnl_after = (
+    (E_base.add(H, fill_value=0.0)).shift(1).mul(drivers, axis=0).sum(axis=1)
+    - cost_series
+).rename("PnL_after")
+
+cum_base = pnl_base.cumsum().rename("Cum_Base")
+cum_after = pnl_after.cumsum().rename("Cum_Hedged")
+
+figF, axF = plt.subplots(figsize=(12, 4.8), dpi=120)
+axF.plot(cum_base.index, cum_base.values, label="Cumul Base")
+axF.plot(cum_after.index, cum_after.values, label="Cumul Hedgé (PCA×Risque)")
+axF.set_title("Cumulative PnL — Base vs Hedgé (positions persistantes)")
+axF.legend(loc="upper left")
+st.pyplot(figF)
+
+k1, k2, k3 = st.columns(3)
+with k1:
+    st.metric("Δ Cumul (Hedgé - Base)", f"{float(cum_after.iloc[-1] - cum_base.iloc[-1]):,.0f}")
+with k2:
+    st.metric("Coût total hedge", f"{float(cost_series.sum()):,.0f}")
+with k3:
+    st.metric("% jours hedge (gate_day>0)", f"{100.0*float((gate_day>0).mean()):.1f}%")
