@@ -1,0 +1,260 @@
+# ============================================================
+# TAB 5 — PCA + HMM → Gate → PCA×Risque → Hedge (SIMPLE / QP)
+# ============================================================
+with tab5:
+
+    st.subheader("Hedge dynamique — PCA × HMM × Optimisation")
+
+    import numpy as np
+    import pandas as pd
+    import matplotlib.pyplot as plt
+    import matplotlib.colormaps as colormaps
+    from sklearn.preprocessing import StandardScaler
+    from sklearn.decomposition import PCA
+    from hmmlearn.hmm import GaussianHMM
+
+    eps = 1e-12
+
+    # ============================================================
+    # 1) PARAMÈTRES
+    # ============================================================
+    c1, c2, c3, c4 = st.columns(4)
+    with c1:
+        hmm_states = st.slider("Nb régimes HMM", 2, 6, 3, 1)
+    with c2:
+        n_iter = st.number_input("HMM n_iter", 50, 2000, 300, 50)
+    with c3:
+        win_pc1_z = st.slider("Fenêtre PC1 z-score", 20, 180, 60, 5)
+    with c4:
+        win_pca = st.slider("Fenêtre PCA rolling", 20, 260, 60, 5)
+
+    d1, d2, d3, d4 = st.columns(4)
+    with d1:
+        p_min = st.slider("Proba min régime", 0.50, 0.95, 0.60, 0.05)
+    with d2:
+        pc1_z_th = st.slider("|PC1_z| min", 0.0, 3.0, 1.0, 0.1)
+    with d3:
+        alpha_max = st.slider("Alpha max", 0.0, 1.0, 0.40, 0.05)
+    with d4:
+        apply_day = st.selectbox("Appliquer hedge", ["Jour T", "Jour T+1"], index=0)
+
+    e1, e2, e3 = st.columns(3)
+    with e1:
+        cum_thresh = st.slider("Seuil masse cumulée risque", 0.50, 0.95, 0.75, 0.05)
+    with e2:
+        n_min = st.slider("N min facteurs", 1, 10, 1)
+    with e3:
+        n_max = st.slider("N max facteurs", 2, 30, 10)
+
+    f1, f2 = st.columns(2)
+    with f1:
+        W_MIN = st.slider("Cap poids PCA min", 0.1, 1.0, 0.5, 0.05)
+    with f2:
+        W_MAX = st.slider("Cap poids PCA max", 1.0, 3.0, 1.5, 0.1)
+
+    g1, g2, g3 = st.columns(3)
+    with g1:
+        cost_rate = st.number_input("Coût Rates", 0.0, 5.0, 0.20, 0.01)
+    with g2:
+        cost_xccy = st.number_input("Coût XCCY", 0.0, 5.0, 0.25, 0.01)
+    with g3:
+        cost_fx = st.number_input("Coût FX", 0.0, 5.0, 0.00, 0.01)
+
+    h1, h2, h3, h4 = st.columns(4)
+    with h1:
+        use_qp = st.checkbox("Solveur QP (cvxpy)", value=False)
+    with h2:
+        lam_risk = st.slider("λ risk", 0.0, 5.0, 1.0, 0.1)
+    with h3:
+        lam_mu = st.slider("λ mu", 0.0, 5.0, 0.0, 0.1)
+    with h4:
+        lam_cost = st.slider("λ cost", 0.0, 5.0, 1.0, 0.1)
+
+    h_max_in = st.number_input("h_max par facteur", 0.0, 1e12, 1e12, 1e9)
+    h_max = None if h_max_in >= 9e11 else float(h_max_in)
+
+    # ============================================================
+    # 2) HELPERS
+    # ============================================================
+    def _bucket(name: str) -> str:
+        u = str(name).upper()
+        if "FX" in u:
+            return "FX"
+        if "XCCY" in u or "BASIS" in u:
+            return "XCCY"
+        return "Rates"
+
+    def cap_renorm_mean1(w, wmin, wmax):
+        w = w / (w.mean() + eps)
+        w = np.clip(w, wmin, wmax)
+        return w / (w.mean() + eps)
+
+    def rolling_pc1_weights_fast(X, win):
+        Xv = X.values
+        T, F = Xv.shape
+        W = np.ones((T, F))
+        if T < win:
+            return W
+        mu = Xv.mean(0)
+        sd = np.where(Xv.std(0) < eps, 1.0, Xv.std(0))
+        Z = (Xv - mu) / sd
+        M = np.zeros((F, F))
+        for i in range(win):
+            zi = Z[i][:, None]
+            M += zi @ zi.T
+        v = np.ones(F) / np.sqrt(F)
+        for t in range(win - 1, T):
+            if t >= win:
+                M += Z[t][:, None] @ Z[t][None, :]
+                M -= Z[t - win][:, None] @ Z[t - win][None, :]
+            S = M / (win - 1)
+            for _ in range(6):
+                v = S @ v
+                v /= np.linalg.norm(v) + eps
+            W[t] = np.abs(v) / (np.abs(v).mean() + eps)
+        return W
+
+    def solve_qp_subset(risk_s, cov_df, mu_s, unit_cost_s):
+        import cvxpy as cp
+        fac = risk_s.index
+        r = risk_s.values
+        m = mu_s.reindex(fac).fillna(0.0).values
+        c = unit_cost_s.reindex(fac).fillna(0.0).values
+        S = cov_df.reindex(fac, fac).fillna(0.0).values
+        S = 0.5 * (S + S.T)
+        h = cp.Variable(len(fac))
+        obj = cp.Minimize(
+            lam_risk * cp.quad_form(r + h, S)
+            - lam_mu * (m @ h)
+            + lam_cost * cp.sum(cp.multiply(c, cp.abs(h)))
+        )
+        cons = []
+        if h_max is not None:
+            cons += [h <= h_max, h >= -h_max]
+        cp.Problem(obj, cons).solve(solver=cp.OSQP, warm_start=True, verbose=False)
+        if h.value is None:
+            return pd.Series(0.0, index=fac)
+        return pd.Series(h.value, index=fac)
+
+    # ============================================================
+    # 3) ALIGN DATA
+    # ============================================================
+    pnl_df = pnl_by_factor.fillna(0.0)
+    idx_all = pnl_df.index
+    cols = pnl_df.columns.tolist()
+
+    risk_df = risk_ts.reindex(idx_all).reindex(cols).fillna(0.0)
+    drivers = drivers_loc.reindex(idx_all).reindex(cols).fillna(0.0)
+    E_base = E_base.reindex(idx_all).reindex(cols).fillna(0.0)
+
+    # ============================================================
+    # 4) HMM
+    # ============================================================
+    X = StandardScaler().fit_transform(pnl_df.values)
+    hmm = GaussianHMM(hmm_states, "full", n_iter=n_iter, random_state=42)
+    hmm.fit(X)
+
+    post = pd.DataFrame(hmm.predict_proba(X), index=idx_all)
+    regime = post.idxmax(1)
+    p_regime = post.max(1)
+    is_switch = regime.ne(regime.shift(1)).fillna(False)
+
+    # ============================================================
+    # 5) PCA (PC1)
+    # ============================================================
+    pc1 = PCA(1).fit_transform(X).ravel()
+    pc1 = pd.Series(pc1, index=idx_all)
+    roll = pc1.rolling(win_pc1_z, min_periods=win_pc1_z // 2)
+    pc1_z = (pc1 - roll.mean()) / (roll.std() + eps)
+
+    gate_day = (
+        ((p_regime - p_min) / (1 - p_min)).clip(0, 1)
+        * (pc1_z.abs() / pc1_z_th).clip(0, 1)
+    ).where(is_switch, 0.0)
+
+    # ============================================================
+    # 6) PCA×Risque → sélection facteurs
+    # ============================================================
+    W = rolling_pc1_weights_fast(pnl_df, win_pca)
+    for t in range(len(W)):
+        W[t] = cap_renorm_mean1(W[t], W_MIN, W_MAX)
+
+    R = risk_df.values
+    score = np.abs(W) * np.abs(R)
+    order = np.argsort(-score, axis=1)
+    score_sorted = np.take_along_axis(score, order, axis=1)
+    cum = np.cumsum(score_sorted, axis=1) / (score_sorted.sum(1, keepdims=True) + eps)
+
+    n_sel = np.clip(np.argmax(cum >= cum_thresh, axis=1) + 1, n_min, n_max)
+    top_idx_list = [order[t, :n_sel[t]] for t in range(len(idx_all))]
+
+    # ============================================================
+    # 7) BUILD HEDGE TABLE
+    # ============================================================
+    plan_rows = []
+    hedge_delta = np.zeros_like(R)
+    cost_series = pd.Series(0.0, index=idx_all)
+
+    unit_cost_by_col = np.array([
+        cost_rate if _bucket(c) == "Rates"
+        else cost_xccy if _bucket(c) == "XCCY"
+        else cost_fx
+        for c in cols
+    ])
+
+    cov_df = drivers.cov()
+
+    for t, d in enumerate(idx_all):
+        alpha_day = alpha_max * gate_day.iloc[t]
+        if alpha_day <= 0:
+            continue
+
+        target_day = d if apply_day == "Jour T" else d + pd.Timedelta(days=1)
+        if target_day not in idx_all:
+            continue
+        tt = idx_all.get_loc(target_day)
+
+        fac_sub = [cols[j] for j in top_idx_list[t]]
+        w_sub = pd.Series(W[t, top_idx_list[t]], index=fac_sub)
+        r_sub = pd.Series(R[t, top_idx_list[t]], index=fac_sub)
+        alpha_used = alpha_day * w_sub
+
+        unit_cost_sub = pd.Series(
+            {f: unit_cost_by_col[cols.index(f)] for f in fac_sub}
+        )
+
+        mu_sub = pd.Series(0.0, index=fac_sub)
+
+        if use_qp:
+            h = solve_qp_subset(r_sub, cov_df, mu_sub, unit_cost_sub)
+            mode = "QP"
+        else:
+            h = -alpha_used * r_sub
+            mode = "SIMPLE"
+
+        for f in fac_sub:
+            hu = h.get(f, 0.0)
+            if abs(hu) < 1e-12:
+                continue
+            j = cols.index(f)
+            hedge_delta[tt, j] += hu
+            cost_series.iloc[tt] += abs(hu) * unit_cost_sub[f]
+
+            plan_rows.append({
+                "Date": target_day,
+                "Mode": mode,
+                "Constituant": f,
+                "Bucket": _bucket(f),
+                "AlphaDay": alpha_day,
+                "W_pca": w_sub[f],
+                "AlphaUsed": alpha_used[f],
+                "Risk": r_sub[f],
+                "HedgeUnits": hu,
+                "UnitCost": unit_cost_sub[f],
+                "CostAlloc": abs(hu) * unit_cost_sub[f],
+            })
+
+    plan_df = pd.DataFrame(plan_rows)
+
+    st.subheader("Plan de hedge (complet)")
+    st.dataframe(plan_df, use_container_width=True, height=450)
