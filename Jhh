@@ -1,0 +1,113 @@
+import numpy as np
+import pandas as pd
+
+def rolling_pc1_select_fast(
+    X: pd.DataFrame,
+    win: int = 60,
+    cum_thresh: float = 0.75,
+    n_min: int = 1,
+    n_max: int = 10,
+    power_iter: int = 8,
+    eps: float = 1e-12,
+):
+    """
+    X: DataFrame (T x F) = pnl_by_factor (ou tes features)
+    Standardisation GLOBALE (perf), rolling covariance add/remove, PC1 par power-iteration.
+
+    Returns:
+      w_day: DataFrame (T x F) poids |loading| normalisés (mean=1) par date
+      n_sel: Series (T,) N sélectionné par date
+      selected_map: dict {date -> [facteurs]}
+    """
+    Xc = X.replace([np.inf, -np.inf], np.nan).fillna(0.0)
+    idx = Xc.index
+    cols = Xc.columns
+    T, F = Xc.shape
+
+    if T < win or F < 2:
+        w_day = pd.DataFrame(0.0, index=idx, columns=cols)
+        n_sel = pd.Series(0, index=idx, name="N_selected")
+        return w_day, n_sel, {}
+
+    # ---- Standardisation globale (une fois) : perf + stabilité
+    Xv = Xc.to_numpy(dtype=float)
+    mu = Xv.mean(axis=0)
+    sig = Xv.std(axis=0, ddof=0)
+    sig = np.where(sig < eps, 1.0, sig)
+    Z = (Xv - mu) / sig  # (T,F)
+
+    # ---- Init rolling covariance accumulator (sum of outer products)
+    # M = sum_{i=t-win+1..t} z_i z_i^T
+    M = np.zeros((F, F), dtype=float)
+    for i in range(win):
+        zi = Z[i].reshape(-1, 1)
+        M += zi @ zi.T
+
+    # ---- Power iteration init
+    v = np.ones(F, dtype=float)
+    v /= (np.linalg.norm(v) + eps)
+
+    w_out = np.zeros((T, F), dtype=float)
+    n_out = np.zeros(T, dtype=int)
+    selected_map = {}
+
+    # dates < win-1 : pas de fenêtre complète -> laisser 0 / vide
+    for t in range(win - 1, T):
+        if t >= win:
+            z_add = Z[t].reshape(-1, 1)
+            z_rem = Z[t - win].reshape(-1, 1)
+            M += z_add @ z_add.T
+            M -= z_rem @ z_rem.T
+
+        # covariance approx
+        S = M / max(1, (win - 1))
+
+        # power iteration (rapide), init = v précédent
+        vt = v
+        for _ in range(power_iter):
+            vt = S @ vt
+            nrm = np.linalg.norm(vt)
+            if nrm < eps:
+                vt = np.ones(F, dtype=float) / np.sqrt(F)
+                break
+            vt = vt / nrm
+        v = vt
+
+        # |loading| + normalisation mean=1 (pour garder le sens d'alpha_max)
+        w = np.abs(v)
+        w = w / (w.mean() + eps)
+
+        w_out[t, :] = w
+
+        # sélection N via masse cumulée
+        order = np.argsort(-w)  # desc
+        w_sorted = w[order]
+        cum = np.cumsum(w_sorted) / (np.sum(w_sorted) + eps)
+
+        sel_idx = order[cum <= cum_thresh]
+        if sel_idx.size == 0:
+            sel_idx = order[:1]
+
+        n = int(np.clip(sel_idx.size, n_min, n_max))
+        sel_idx = sel_idx[:n]
+
+        n_out[t] = n
+        selected_map[idx[t]] = [cols[i] for i in sel_idx]
+
+    w_day = pd.DataFrame(w_out, index=idx, columns=cols)
+    n_sel = pd.Series(n_out, index=idx, name="N_selected")
+
+    return w_day, n_sel, selected_map
+
+win_pca = st.slider("Fenêtre PCA rolling (jours)", 20, 260, 60, 5)
+cum_thresh = st.slider("Seuil masse cumulée |PC1|", 0.50, 0.95, 0.75, 0.05)
+n_min = st.slider("N min", 1, 10, 1)
+n_max = st.slider("N max", 2, 30, 10)
+
+w_day, n_sel, selected_map = rolling_pc1_select_fast(
+    pnl_by_factor, win=win_pca, cum_thresh=cum_thresh, n_min=n_min, n_max=n_max,
+    power_iter=8
+)
+
+st.subheader("N sélectionné (PCA PC1 masse cumulée)")
+st.line_chart(n_sel)
